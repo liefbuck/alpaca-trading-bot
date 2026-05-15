@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Trading Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;padding:24px}
+    h1{font-size:1.3rem;font-weight:700;color:#58a6ff;margin-bottom:20px}
+    h2{font-size:0.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px}
+    .card .label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+    .card .value{font-size:1.5rem;font-weight:700}
+    .green{color:#3fb950}.red{color:#f85149}.blue{color:#58a6ff}.yellow{color:#d29922}
+    .section{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:20px}
+    .progress-wrap{margin:12px 0}
+    .progress-bar-bg{background:#21262d;border-radius:999px;height:10px;overflow:hidden}
+    .progress-bar{height:10px;border-radius:999px;transition:width .4s}
+    .progress-label{font-size:.75rem;color:#8b949e;margin-top:4px}
+    table{width:100%;border-collapse:collapse;font-size:.85rem}
+    th{color:#8b949e;font-weight:500;text-align:left;padding:8px 10px;border-bottom:1px solid #21262d}
+    td{padding:8px 10px;border-bottom:1px solid #21262d}
+    .log-box{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:14px;font-family:monospace;font-size:.72rem;color:#8b949e;max-height:200px;overflow-y:auto;white-space:pre-wrap}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:600}
+    .badge-green{background:#1a3a1a;color:#3fb950}
+    .badge-red{background:#3a1a1a;color:#f85149}
+    .refresh-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+    button{background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:.82rem}
+    button:hover{background:#30363d}
+    #lastUpdated{font-size:.75rem;color:#8b949e}
+  </style>
+</head>
+<body>
+<h1>Trading Dashboard</h1>
+<div class="refresh-bar">
+  <span id="lastUpdated">Loading…</span>
+  <button onclick="load()">&#8635; Refresh</button>
+</div>
+<div id="root"></div>
+
+<script>
+const TARGET = 200, LIMIT = -100;
+
+async function load(){
+  const d = await fetch('/api/status').then(r=>r.json());
+  render(d);
+  document.getElementById('lastUpdated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+const fmt = (n,d=2)=>Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const sign = n => n>=0?'+':'';
+
+function pnlColor(n){ return n>0?'green':n<0?'red':'' }
+
+function progressBar(pnl){
+  const range = TARGET - LIMIT; // 300
+  const offset = pnl - LIMIT;  // how far above the loss floor
+  const pct = Math.min(100, Math.max(0, offset/range*100));
+  const color = pnl>=TARGET?'#3fb950':pnl<=LIMIT?'#f85149':'#58a6ff';
+  return `
+    <div class="progress-wrap">
+      <div class="progress-bar-bg"><div class="progress-bar" style="width:${pct}%;background:${color}"></div></div>
+      <div class="progress-label">Loss limit $${LIMIT} &nbsp;|&nbsp; Today: <b>${sign(pnl)}$${fmt(pnl)}</b> &nbsp;|&nbsp; Target $${TARGET}</div>
+    </div>`;
+}
+
+function render({account, positions, t_position, t_bars, bot_log}){
+  const pnl = account.daily_pnl;
+  const pColor = pnlColor(pnl);
+
+  // ── Account + Daily P&L ──
+  let html = `
+  <div class="section">
+    <h2>Account Overview</h2>
+    ${progressBar(pnl)}
+    <div class="grid" style="margin-top:16px">
+      <div class="card"><div class="label">Daily P&amp;L</div><div class="value ${pColor}">${sign(pnl)}$${fmt(pnl)}</div></div>
+      <div class="card"><div class="label">Portfolio Value</div><div class="value">$${fmt(account.portfolio_value)}</div></div>
+      <div class="card"><div class="label">Cash</div><div class="value">$${fmt(account.cash)}</div></div>
+      <div class="card"><div class="label">Buying Power</div><div class="value">$${fmt(account.buying_power)}</div></div>
+    </div>
+  </div>`;
+
+  // ── Bot Positions ──
+  html += `<div class="section"><h2>Open Positions</h2>`;
+  if(positions.length){
+    html += `<table>
+      <tr><th>Symbol</th><th>Qty</th><th>Avg Entry</th><th>Current</th><th>Value</th><th>Unreal. P&amp;L</th></tr>`;
+    for(const p of positions){
+      const c = pnlColor(p.unrealized_pl);
+      html += `<tr>
+        <td class="blue"><b>${p.symbol}</b></td>
+        <td>${p.qty}</td>
+        <td>$${fmt(p.avg_entry_price)}</td>
+        <td>$${fmt(p.current_price)}</td>
+        <td>$${fmt(p.market_value)}</td>
+        <td class="${c}">${sign(p.unrealized_pl)}$${fmt(p.unrealized_pl)} (${sign(p.unrealized_plpc)}${fmt(p.unrealized_plpc)}%)</td>
+      </tr>`;
+    }
+    html += `</table>`;
+  } else {
+    html += `<div style="color:#8b949e;padding:10px 0">No open positions. Bot will enter trades at 9:35 AM ET on the next market day.</div>`;
+  }
+  html += `</div>`;
+
+  // ── T position + chart ──
+  if(t_position){
+    const c = pnlColor(t_position.unrealized_pl);
+    html += `<div class="section"><h2>T (AT&amp;T) — Manual Position</h2>
+    <div class="grid">
+      <div class="card"><div class="label">Shares</div><div class="value">${t_position.qty}</div></div>
+      <div class="card"><div class="label">Avg Entry</div><div class="value">$${fmt(t_position.avg_entry_price)}</div></div>
+      <div class="card"><div class="label">Current Price</div><div class="value">$${fmt(t_position.current_price)}</div></div>
+      <div class="card"><div class="label">Unrealized P&amp;L</div><div class="value ${c}">${sign(t_position.unrealized_pl)}$${fmt(t_position.unrealized_pl)}</div></div>
+    </div></div>`;
+  }
+
+  if(t_bars && t_bars.length){
+    html += `<div class="section"><h2>T — 30-Day Price Chart</h2><canvas id="chart" height="90"></canvas></div>`;
+  }
+
+  // ── Bot log ──
+  html += `<div class="section"><h2>Bot Activity Log</h2>
+    <div class="log-box" id="logbox">${bot_log.length ? bot_log.join('\n') : 'No log entries yet. Start bot.py to begin trading.'}</div>
+  </div>`;
+
+  document.getElementById('root').innerHTML = html;
+
+  // scroll log to bottom
+  const lb = document.getElementById('logbox');
+  if(lb) lb.scrollTop = lb.scrollHeight;
+
+  if(t_bars && t_bars.length){
+    new Chart(document.getElementById('chart').getContext('2d'),{
+      type:'line',
+      data:{
+        labels: t_bars.map(b=>b.date),
+        datasets:[{label:'Close',data:t_bars.map(b=>b.close),borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,0.08)',tension:.3,pointRadius:2,fill:true}]
+      },
+      options:{
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{ticks:{color:'#8b949e',maxTicksLimit:10},grid:{color:'#21262d'}},
+          y:{ticks:{color:'#8b949e',callback:v=>'$'+v.toFixed(2)},grid:{color:'#21262d'}}
+        }
+      }
+    });
+  }
+}
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
