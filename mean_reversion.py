@@ -67,7 +67,12 @@ def calc_rsi(closes: pd.Series, period: int = RSI_PERIOD) -> float:
 
 
 def is_market_open() -> bool:
-    return client.get_clock().is_open
+    clock = client.get_clock()
+    if not clock.is_open:
+        now = datetime.now(ET)
+        if now.minute == 0:
+            log.info(f"Market closed ({now.strftime('%A %H:%M ET')}). Next open: {clock.next_open}")
+    return clock.is_open
 
 
 def get_daily_pnl() -> float:
@@ -188,12 +193,24 @@ def eod_close():
     trading_active = False
 
 
+def daily_reset():
+    """Reset state at the start of each trading day."""
+    global trading_active
+    clock = client.get_clock()
+    if not clock.is_open:
+        return
+    trading_active = True
+    log.info("=" * 40)
+    log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
+    log.info("=" * 40)
+
+
 # ── Schedule ──────────────────────────────────────────────────────────────────
-# Runs AFTER the momentum bot's morning window (11 AM and again at 1 PM)
-schedule.every().day.at("11:00").do(open_positions)
-schedule.every().day.at("13:00").do(open_positions)   # second scan if slots remain
-schedule.every(3).minutes.do(check_exits)              # same 3-min cadence as momentum bot
-schedule.every().day.at("15:45").do(eod_close)
+schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
+schedule.every().day.at("11:00").do(open_positions)    # First scan
+schedule.every().day.at("13:00").do(open_positions)    # Second scan if slots remain
+schedule.every(3).minutes.do(check_exits)              # P&L check every 3 min
+schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
 if __name__ == "__main__":
     log.info("=" * 60)

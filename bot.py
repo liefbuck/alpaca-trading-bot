@@ -61,7 +61,13 @@ def get_account():
 
 
 def is_market_open() -> bool:
-    return client.get_clock().is_open
+    clock = client.get_clock()
+    if not clock.is_open:
+        now = datetime.now(ET)
+        # Suppress noisy weekend logging — only log once per hour
+        if now.minute == 0:
+            log.info(f"Market closed ({now.strftime('%A %H:%M ET')}). Next open: {clock.next_open}")
+    return clock.is_open
 
 
 def scan_momentum() -> list:
@@ -181,9 +187,22 @@ def eod_close():
     trading_active = False
 
 
+def daily_reset():
+    """Reset state at the start of each trading day."""
+    global trading_active
+    clock = client.get_clock()
+    if not clock.is_open:
+        return  # Only reset on actual trading days
+    trading_active = True
+    log.info("=" * 40)
+    log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
+    log.info("=" * 40)
+
+
 # ── Schedule ─────────────────────────────────────────────────────────────────
-schedule.every().day.at("09:35").do(open_positions)   # Enter 5 min after open
-schedule.every(3).minutes.do(check_pnl)               # P&L check every 3 min
+schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
+schedule.every().day.at("09:35").do(open_positions)    # Enter 5 min after open
+schedule.every(3).minutes.do(check_pnl)                # P&L check every 3 min
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
 if __name__ == "__main__":
