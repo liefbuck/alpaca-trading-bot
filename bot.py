@@ -123,7 +123,7 @@ def open_positions():
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
             ))
-            log.info(f"BUY {qty}x {stock['symbol']} ~${stock['price']} | gap {stock['change_pct']}% | relvol {stock['rel_volume']}x")
+            log.info(f"BUY {qty}x {stock['symbol']} ~${stock['price']} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
             bought.append(stock["symbol"])
         except Exception as e:
             log.error(f"Order failed {stock['symbol']}: {e}")

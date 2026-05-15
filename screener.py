@@ -27,16 +27,19 @@ def get_sp500() -> list:
 
 def get_top_momentum(n: int = 50) -> list:
     """
-    Return up to n tickers ranked by momentum score (gap% x relative volume).
-    Batch-downloads the full S&P 500 — takes ~30-45 seconds.
+    Score each S&P 500 stock by:
+      gap%  x  today's relative volume  x  30-day volume trend
+    The 30-day volume trend rewards stocks whose volume has been
+    consistently rising — early 10 days vs recent 10 days comparison.
+    Batch-downloads 30 days so all three signals are available at once.
     """
     universe = get_sp500()
-    log.info(f"Downloading {len(universe)} tickers for momentum scan...")
+    log.info(f"Downloading {len(universe)} tickers for momentum scan (30d)...")
 
     try:
         raw = yf.download(
             universe,
-            period="5d",
+            period="30d",
             interval="1d",
             group_by="ticker",
             auto_adjust=True,
@@ -53,30 +56,50 @@ def get_top_momentum(n: int = 50) -> list:
             if symbol not in raw.columns.get_level_values(0):
                 continue
             df = raw[symbol].dropna()
-            if len(df) < 2:
+            if len(df) < 20:
                 continue
+
             prev_close = float(df["Close"].iloc[-2])
             current    = float(df["Close"].iloc[-1])
-            vol_today  = float(df["Volume"].iloc[-1])
-            vol_avg    = float(df["Volume"].mean())
-            if prev_close == 0 or vol_avg == 0:
+            if prev_close == 0:
                 continue
+
+            vol = df["Volume"]
+            vol_today = float(vol.iloc[-1])
+            vol_avg   = float(vol.mean())
+            if vol_avg == 0:
+                continue
+
+            # 30-day volume trend: compare first-half avg vs second-half avg
+            # A ratio > 1 means volume is growing over the month
+            mid = len(vol) // 2
+            vol_early  = float(vol.iloc[:mid].mean())
+            vol_recent = float(vol.iloc[mid:].mean())
+            vol_trend  = (vol_recent / vol_early) if vol_early > 0 else 1.0
+
             change_pct = (current - prev_close) / prev_close * 100
             rel_vol    = vol_today / vol_avg
-            score      = change_pct * rel_vol
+
+            # Score = gap% x today's relative vol x 30-day vol trend
+            score = change_pct * rel_vol * vol_trend
+
             candidates.append({
                 "symbol":     symbol,
                 "price":      round(current, 2),
                 "change_pct": round(change_pct, 2),
                 "rel_vol":    round(rel_vol, 2),
+                "vol_trend":  round(vol_trend, 2),
                 "score":      round(score, 3),
             })
         except Exception:
             continue
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    top = [c for c in candidates if c["change_pct"] > 0.5]
-    log.info(f"Momentum scan complete — {len(top)} stocks up >0.5% out of {len(candidates)} scanned")
+    top = [c for c in candidates if c["change_pct"] > 0.5 and c["vol_trend"] > 1.0]
+    log.info(
+        f"Momentum scan complete — {len(top)} stocks up >0.5% with rising 30d volume "
+        f"out of {len(candidates)} scanned"
+    )
     return top[:n]
 
 
