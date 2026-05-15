@@ -58,7 +58,7 @@ if not top3:
 acct = client.get_account()
 buying_power = float(acct.buying_power)
 DAILY_TARGET = 200
-MAX_POSITIONS = 3
+MAX_POSITIONS = 5
 
 print("\n=== PLACING ORDERS ===")
 for stock in top3:

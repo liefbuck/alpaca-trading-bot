@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
 DAILY_TARGET = 200.0
 DAILY_LOSS_LIMIT = -100.0
-MAX_POSITIONS = 3
+MAX_POSITIONS = 5
 STATE_FILE = "bot_state.json"
 
 # Broad watchlist of liquid, volatile stocks to scan for momentum
