@@ -1,11 +1,18 @@
 @echo off
-echo Starting trading bot...
-start "Trading Bot" python bot.py
+echo Starting momentum bot (9:35 AM entries)...
+start "Momentum Bot" python bot.py
+
+echo Starting mean reversion bot (11:00 AM + 1:00 PM entries)...
+start "Mean Reversion Bot" python mean_reversion.py
 
 echo Starting dashboard...
-start "Dashboard" python dashboard.py
+start "Dashboard" python serve.py
+
+timeout /t 2 /nobreak >nul
+start http://localhost:5000/dashboard.html
 
 echo.
-echo Bot running in background.
-echo Dashboard at http://localhost:5000
-start http://localhost:5000/dashboard.html
+echo All systems running.
+echo Momentum bot:      targets top 5 gap-up movers at open
+echo Mean reversion bot: targets 5 oversold stocks at 11am and 1pm
+echo Dashboard:         http://localhost:5000/dashboard.html

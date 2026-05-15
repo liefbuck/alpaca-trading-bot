@@ -36,6 +36,10 @@
     .err{color:#f85149;font-size:.8rem;padding:10px}
     .section-sub{font-size:.75rem;color:#8b949e;margin-bottom:10px}
     .divider{border:none;border-top:1px solid #21262d;margin:14px 0}
+    .log-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .log-box{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:12px;font-family:monospace;font-size:.68rem;color:#8b949e;height:160px;overflow-y:auto;white-space:pre-wrap}
+    .log-label{font-size:.7rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+    @media(max-width:600px){.log-grid{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -80,15 +84,21 @@ async function getBars(symbol) {
   } catch { return []; }
 }
 
+async function getLogs() {
+  try { return await fetch("/logs").then(r => r.json()); }
+  catch { return { momentum: [], mean_reversion: [] }; }
+}
+
 async function load() {
   try {
-    const [account, positions, orders, bars] = await Promise.all([
+    const [account, positions, orders, bars, logs] = await Promise.all([
       apca(`${TRADE_URL}/account`),
       apca(`${TRADE_URL}/positions`),
       getTodayOrders(),
       getBars("T"),
+      getLogs(),
     ]);
-    render(account, positions, orders, bars);
+    render(account, positions, orders, bars, logs);
     document.getElementById("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
   } catch(e) {
     document.getElementById("root").innerHTML = `<div class="err">Error: ${e.message}</div>`;
@@ -147,7 +157,7 @@ function calcRealizedPnl(orders) {
 
 let chartInstance = null;
 
-function render(account, positions, orders, bars) {
+function render(account, positions, orders, bars, logs = {}) {
   const equity     = parseFloat(account.equity);
   const lastEquity = parseFloat(account.last_equity);
   const dailyPnl   = equity - lastEquity;
@@ -252,12 +262,35 @@ function render(account, positions, orders, bars) {
 
   html += `</div>`;
 
+  // ── Bot Logs ──────────────────────────────────────────────────────────────
+  const momLog = (logs.momentum || []).join("\n") || "No momentum log yet. Start bot.py.";
+  const mrLog  = (logs.mean_reversion || []).join("\n") || "No mean reversion log yet. Start mean_reversion.py.";
+  html += `
+  <div class="section">
+    <h2>Bot Activity</h2>
+    <div class="log-grid">
+      <div>
+        <div class="log-label">&#9650; Momentum Bot</div>
+        <div class="log-box" id="logMom">${momLog}</div>
+      </div>
+      <div>
+        <div class="log-label">&#8635; Mean Reversion Bot</div>
+        <div class="log-box" id="logMR">${mrLog}</div>
+      </div>
+    </div>
+  </div>`;
+
   // ── T chart ───────────────────────────────────────────────────────────────
   if (bars.length) {
     html += `<div class="section"><h2>T (AT&amp;T) — 30-Day Price Chart</h2><canvas id="chart" height="90"></canvas></div>`;
   }
 
   document.getElementById("root").innerHTML = html;
+
+  ["logMom","logMR"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.scrollTop = el.scrollHeight;
+  });
 
   if (bars.length) {
     if (chartInstance) chartInstance.destroy();
