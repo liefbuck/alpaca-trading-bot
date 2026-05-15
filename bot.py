@@ -2,7 +2,6 @@ import os
 import json
 import time
 import schedule
-import yfinance as yf
 from datetime import datetime
 import pytz
 import logging
@@ -11,6 +10,7 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from screener import get_top_momentum
 
 load_dotenv()
 
@@ -29,13 +29,6 @@ DAILY_TARGET = 200.0
 DAILY_LOSS_LIMIT = -100.0
 MAX_POSITIONS = 5
 STATE_FILE = "bot_state.json"
-
-# Broad watchlist of liquid, volatile stocks to scan for momentum
-WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD",
-    "NFLX", "COIN", "PLTR", "SOFI", "MARA", "RIOT", "ROKU", "SNAP",
-    "UBER", "LYFT", "SHOP", "SQ",
-]
 
 client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
@@ -72,37 +65,10 @@ def is_market_open() -> bool:
 
 
 def scan_momentum() -> list:
-    """Score watchlist stocks by gap % * relative volume. Higher = more momentum."""
-    candidates = []
-    for symbol in WATCHLIST:
-        try:
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="5d", interval="1d")
-            if len(hist) < 2:
-                continue
-            prev_close = float(hist["Close"].iloc[-2])
-            info = ticker.fast_info
-            current = getattr(info, "last_price", None)
-            if not current or not prev_close:
-                continue
-            change_pct = (current - prev_close) / prev_close * 100
-            avg_vol = getattr(info, "three_month_average_volume", None) or 1
-            last_vol = float(hist["Volume"].iloc[-1])
-            rel_vol = last_vol / avg_vol
-            score = change_pct * rel_vol
-            candidates.append({
-                "symbol": symbol,
-                "price": round(current, 2),
-                "change_pct": round(change_pct, 2),
-                "rel_volume": round(rel_vol, 2),
-                "score": round(score, 4),
-            })
-        except Exception as e:
-            log.warning(f"Scan error {symbol}: {e}")
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    log.info(f"Top movers: {[(c['symbol'], c['change_pct']) for c in candidates[:5]]}")
-    return [c for c in candidates if c["change_pct"] > 0.5][:MAX_POSITIONS]
+    """Scan the full S&P 500 for top momentum plays."""
+    top = get_top_momentum(n=50)
+    log.info(f"Top movers: {[(c['symbol'], c['change_pct']) for c in top[:5]]}")
+    return top[:MAX_POSITIONS]
 
 
 def position_size(price: float) -> int:

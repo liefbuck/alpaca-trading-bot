@@ -10,7 +10,6 @@ import json
 import time
 import schedule
 import yfinance as yf
-import pandas as pd
 from datetime import datetime
 import pytz
 import logging
@@ -19,6 +18,7 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from screener import get_top_mean_reversion
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -47,23 +47,6 @@ RSI_EXIT      = 50   # RSI recovery exit
 SMA_PERIOD    = 20
 MIN_PCT_BELOW = 1.0  # price must be at least 1% below SMA to qualify
 
-# Broader watchlist of liquid large/mid caps — good mean reversion candidates
-WATCHLIST = [
-    # Finance
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK",
-    # Tech
-    "ORCL", "INTC", "QCOM", "TXN", "MU", "IBM", "CSCO",
-    # Consumer
-    "WMT", "TGT", "COST", "HD", "LOW", "NKE", "MCD",
-    # Energy
-    "XOM", "CVX", "SLB", "HAL", "OXY",
-    # Healthcare
-    "JNJ", "PFE", "MRNA", "BMY", "ABBV", "MRK",
-    # ETFs (sector plays)
-    "XLF", "XLE", "XLK", "XLV", "XLI", "IWM",
-    # Volatile momentum names that also mean-revert
-    "NVDA", "AMD", "TSLA", "COIN", "PLTR", "MARA", "RIOT",
-]
 
 client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
@@ -93,34 +76,11 @@ def get_daily_pnl() -> float:
 
 
 def scan_mean_reversion() -> list:
-    """Find oversold stocks trading below their 20-day SMA."""
-    candidates = []
-    for symbol in WATCHLIST:
-        try:
-            hist = yf.Ticker(symbol).history(period="60d", interval="1d")
-            if len(hist) < SMA_PERIOD + RSI_PERIOD:
-                continue
-            closes = hist["Close"]
-            current = float(closes.iloc[-1])
-            sma     = float(closes.rolling(SMA_PERIOD).mean().iloc[-1])
-            rsi     = calc_rsi(closes)
-            pct_below = (sma - current) / sma * 100
-
-            if rsi < RSI_OVERSOLD and pct_below >= MIN_PCT_BELOW:
-                candidates.append({
-                    "symbol":    symbol,
-                    "price":     round(current, 2),
-                    "rsi":       round(rsi, 1),
-                    "sma":       round(sma, 2),
-                    "pct_below": round(pct_below, 2),
-                    "score":     round(RSI_OVERSOLD - rsi, 2),  # lower RSI = higher score
-                })
-                log.info(f"  SIGNAL {symbol}  price=${current:.2f}  RSI={rsi:.1f}  {pct_below:.1f}% below SMA")
-        except Exception as e:
-            log.warning(f"Scan error {symbol}: {e}")
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates[:MAX_POSITIONS]
+    """Scan the full S&P 500 for oversold stocks below their 20-day SMA."""
+    results = get_top_mean_reversion(n=50)
+    for s in results[:5]:
+        log.info(f"  SIGNAL {s['symbol']}  ${s['price']}  RSI={s['rsi']}  {s['pct_below']}% below SMA")
+    return results[:MAX_POSITIONS]
 
 
 def position_size(price: float) -> int:
