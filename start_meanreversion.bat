@@ -1,9 +1,7 @@
 @echo off
-echo Starting BOTH BOTS...
-echo Momentum:      top 5 gap-up movers at 9:35 AM
-echo Mean Reversion: RSI under 30 stocks at 11am and 1pm
+echo Starting MEAN REVERSION BOT only...
+echo Strategy: RSI under 30 + below 20-day SMA, entries at 11am and 1pm, $40 target per position
 echo.
-start "Momentum Bot" python bot.py
 start "Mean Reversion Bot" python mean_reversion.py
 start "Dashboard" python serve.py
 timeout /t 2 /nobreak >nul
