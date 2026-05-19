@@ -160,10 +160,31 @@ def record_trade(symbol: str, pl: float):
 
 def close_position(symbol: str, pl: float = None):
     try:
+        pos = client.get_open_position(symbol)
+        entry_price = float(pos.avg_entry_price)
+        qty = float(pos.qty)
         client.close_position(symbol)
         log.info(f"Closed position: {symbol}")
-        if pl is not None:
-            record_trade(symbol, pl)
+        # Wait briefly for the fill, then record actual realized P&L
+        time.sleep(1)
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            orders = client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[symbol],
+                limit=5,
+            ))
+            sell = next((o for o in orders if o.side.value == "sell" and o.filled_avg_price), None)
+            if sell:
+                actual_pl = (float(sell.filled_avg_price) - entry_price) * qty
+                log.info(f"  {symbol} actual fill: ${float(sell.filled_avg_price):.4f} | realized P&L: ${actual_pl:.2f} (logged ${pl:.2f})")
+                record_trade(symbol, actual_pl)
+            elif pl is not None:
+                record_trade(symbol, pl)
+        except Exception:
+            if pl is not None:
+                record_trade(symbol, pl)
     except Exception as e:
         log.error(f"Error closing {symbol}: {e}")
 
@@ -185,7 +206,7 @@ def check_pnl():
     if not is_market_open():
         return
 
-    per_position_target = DAILY_TARGET / MAX_POSITIONS      # ~$40
+    per_position_target = DAILY_TARGET / MAX_POSITIONS      # ~$20
 
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
