@@ -1,9 +1,8 @@
 """
 Mean Reversion Bot
 Strategy: buy stocks that are oversold (RSI < 30) and trading below their
-20-day SMA. Waits for the morning volatility to settle then runs 11 AM - 2:30 PM ET.
-Each position targets +$40 profit, stops at -$20. Max 5 positions per day.
-Complements the momentum bot which runs at the open.
+20-day SMA. Waits for the morning volatility to settle then runs 11 AM - 1 PM ET.
+Targets and limits are read from config.py. Complements the momentum bot.
 """
 import os
 import json
@@ -173,7 +172,7 @@ def open_positions():
 
 
 def check_exits():
-    """Close positions that hit their +$40 target, -$20 stop, or RSI has recovered."""
+    """Close positions that hit their profit target, stop, or RSI has recovered."""
     global trading_active
     if not trading_active or not is_market_open():
         return
@@ -182,8 +181,14 @@ def check_exits():
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
     if daily_pnl <= DAILY_LOSS_LIMIT:
-        log.info(f"DAILY LOSS LIMIT ${daily_pnl:.2f} — closing everything.")
-        client.close_all_positions(cancel_orders=True)
+        log.info(f"DAILY LOSS LIMIT ${daily_pnl:.2f} — closing mean-reversion positions.")
+        mr_state = load_mr_state()
+        for symbol in mr_state.get("positions", []):
+            try:
+                client.close_position(symbol)
+            except Exception as e:
+                log.error(f"Loss limit close error {symbol}: {e}")
+        save_mr_state({"positions": []})
         trading_active = False
         return
 
@@ -250,7 +255,8 @@ def daily_reset():
     """Reset state at the start of each trading day."""
     global trading_active
     clock = client.get_clock()
-    if not clock.is_open:
+    now = datetime.now(ET)
+    if clock.next_open.date() != now.date() and not clock.is_open:
         return
     trading_active = True
     # Refresh session_baseline so daily P&L starts from today's open equity

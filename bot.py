@@ -89,11 +89,9 @@ def scan_momentum() -> list:
 
 
 def position_size(price: float) -> int:
-    """Size each position so a 1% move hits ~$67 profit (1/3 of $200 target)."""
     acct = get_account()
     buying_power = float(acct.buying_power) / MAX_POSITIONS
-    target_per_pos = DAILY_TARGET / MAX_POSITIONS
-    shares_for_target = int(target_per_pos / (price * 0.01))
+    shares_for_target = int(PER_POSITION_TARGET / (price * 0.01))
     max_affordable = int(buying_power / price)
     return max(1, min(shares_for_target, max_affordable))
 
@@ -175,7 +173,8 @@ def close_position(symbol: str, pl: float = None):
             sell = next((o for o in orders if o.side.value == "sell" and o.filled_avg_price), None)
             if sell:
                 actual_pl = (float(sell.filled_avg_price) - entry_price) * qty
-                log.info(f"  {symbol} actual fill: ${float(sell.filled_avg_price):.4f} | realized P&L: ${actual_pl:.2f} (logged ${pl:.2f})")
+                logged = f"${pl:.2f}" if pl is not None else "n/a"
+                log.info(f"  {symbol} actual fill: ${float(sell.filled_avg_price):.4f} | realized P&L: ${actual_pl:.2f} (logged {logged})")
                 record_trade(symbol, actual_pl)
             elif pl is not None:
                 record_trade(symbol, pl)
@@ -203,8 +202,6 @@ def check_pnl():
     if not is_market_open():
         return
 
-    per_position_target = DAILY_TARGET / MAX_POSITIONS      # ~$20
-
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
 
@@ -216,14 +213,14 @@ def check_pnl():
             continue
         pl = float(pos.unrealized_pl)
         symbol = pos.symbol
-        if pl >= per_position_target:
+        if pl >= PER_POSITION_TARGET:
             log.info(f"TARGET HIT {symbol} +${pl:.2f} — closing.")
             close_position(symbol, pl)
         elif pl <= PER_POSITION_LOSS_LIMIT:
             log.info(f"LOSS LIMIT {symbol} ${pl:.2f} — closing.")
             close_position(symbol, pl)
         else:
-            log.info(f"  {symbol}  P&L ${pl:+.2f}  (target ${per_position_target:.0f} | limit ${PER_POSITION_LOSS_LIMIT:.0f})")
+            log.info(f"  {symbol}  P&L ${pl:+.2f}  (target ${PER_POSITION_TARGET:.0f} | limit ${PER_POSITION_LOSS_LIMIT:.0f})")
 
     # Kill switch: stop trading for the day if total daily loss is too deep
     if daily_pnl <= DAILY_LOSS_LIMIT:
@@ -281,8 +278,10 @@ def daily_reset():
     """Reset state at the start of each trading day."""
     global trading_active
     clock = client.get_clock()
-    if not clock.is_open:
-        return  # Only reset on actual trading days
+    # Guard: skip weekends/holidays by checking next open is today
+    now = datetime.now(ET)
+    if clock.next_open.date() != now.date() and not clock.is_open:
+        return
     trading_active = True
     reset_session()
     state = load_state()
