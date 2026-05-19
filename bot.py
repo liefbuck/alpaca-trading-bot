@@ -7,6 +7,8 @@ import pytz
 import logging
 from dotenv import load_dotenv
 
+import yfinance as yf
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -81,6 +83,22 @@ def is_market_open() -> bool:
     return clock.is_open
 
 
+def spy_is_positive() -> bool:
+    """Return True if SPY is up on the day — don't buy momentum into a falling market."""
+    try:
+        data = yf.Ticker("SPY").history(period="2d", interval="1d")
+        if len(data) < 2:
+            return True  # can't tell — allow entry
+        prev  = float(data["Close"].iloc[-2])
+        today = float(data["Close"].iloc[-1])
+        change = (today - prev) / prev * 100
+        log.info(f"SPY day change: {change:+.2f}%")
+        return change >= 0
+    except Exception as e:
+        log.warning(f"SPY check failed ({e}) — allowing entry")
+        return True
+
+
 def scan_momentum() -> list:
     """Scan the full S&P 500 for top momentum plays."""
     top = get_top_momentum(n=50)
@@ -109,6 +127,11 @@ def open_positions():
     if pnl <= DAILY_LOSS_LIMIT:
         log.info(f"Loss limit already hit (${pnl:.2f}). No new entries.")
         trading_active = False
+        return
+
+    # Market direction filter: skip momentum buys on down-market days
+    if not spy_is_positive():
+        log.info("SPY is negative on the day — skipping momentum entry.")
         return
 
     # Check if we already have open positions — don't stack

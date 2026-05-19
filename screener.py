@@ -115,7 +115,7 @@ def get_top_momentum(n: int = 50) -> list:
             continue
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    top = [c for c in candidates if c["change_pct"] > 0.5 and c["vol_trend"] > 1.0]
+    top = [c for c in candidates if c["change_pct"] > 0.5 and c["vol_trend"] > 1.0 and c["rel_vol"] > 1.0]
     log.info(
         f"Momentum scan complete — {len(top)} stocks up >0.5% with rising 30d volume "
         f"out of {len(candidates)} scanned"
