@@ -249,7 +249,6 @@ def log_daily_performance():
         "result":      "WIN" if daily_pnl > 0 else "LOSS",
     }
 
-    log = logging.getLogger(__name__)
     log.info(f"EOD Summary: {entry}")
 
     history = []
