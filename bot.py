@@ -317,6 +317,20 @@ if __name__ == "__main__":
     log.info("Trading bot started")
     log.info(f"Daily target: ${DAILY_TARGET} | Loss limit: ${DAILY_LOSS_LIMIT}")
     log.info("=" * 60)
+    # On startup: if state file has no baseline for today, reset it now so
+    # check_pnl doesn't immediately see a stale loss and kill trading.
+    state = load_state()
+    today = str(datetime.now(ET).date())
+    if state.get("date") != today or not state.get("session_baseline"):
+        log.info("Startup: no baseline for today — resetting session.")
+        reset_session()
+        state = load_state()
+        state["date"] = today
+        state.setdefault("positions", [])
+        state.setdefault("trades_today", [])
+        save_state(state)
+    else:
+        log.info(f"Startup: using existing baseline ${state['session_baseline']:.2f} for {today}")
     while True:
         schedule.run_pending()
         time.sleep(30)
