@@ -210,24 +210,25 @@ def check_exits():
             hist = yf.Ticker(symbol).history(period="30d", interval="1d")
             rsi  = calc_rsi(hist["Close"])
             rsi_recovered = rsi >= RSI_EXIT
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"RSI check failed for {symbol}: {e}")
 
         closed = False
         if pl >= PER_TARGET:
             log.info(f"TARGET HIT {symbol} +${pl:.2f} — closing.")
-            client.close_position(symbol)
-            closed = True
         elif pl <= PER_STOP:
             log.info(f"STOP HIT {symbol} ${pl:.2f} — closing.")
-            client.close_position(symbol)
-            closed = True
         elif rsi_recovered:
             log.info(f"RSI RECOVERED {symbol} RSI>={RSI_EXIT}, P&L=${pl:.2f} — closing.")
-            client.close_position(symbol)
-            closed = True
         else:
             log.info(f"  {symbol}  P&L ${pl:+.2f}  (target +${PER_TARGET:.0f} | stop ${PER_STOP:.0f})")
+
+        if pl >= PER_TARGET or pl <= PER_STOP or rsi_recovered:
+            try:
+                client.close_position(symbol)
+                closed = True
+            except Exception as e:
+                log.error(f"Error closing {symbol}: {e}")
 
         if closed:
             owned.discard(symbol)

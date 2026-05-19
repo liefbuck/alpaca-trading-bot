@@ -3,7 +3,11 @@ import http.server
 import json
 import os
 import sys
+import urllib.request
+import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP, MAX_POSITIONS, PER_POSITION_TARGET
 
 PORT = 5000
@@ -57,8 +61,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             state = {}
             state_path = os.path.join(BASE_DIR, "bot_state.json")
             if os.path.exists(state_path):
-                with open(state_path) as f:
-                    state = json.load(f)
+                try:
+                    with open(state_path) as f:
+                        state = json.load(f)
+                except Exception:
+                    state = {}
             cfg = {
                 "daily_target":         DAILY_TARGET,
                 "daily_loss_limit":     DAILY_LOSS_LIMIT,
@@ -74,6 +81,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(data)
+            return
+
+        if self.path.startswith("/proxy?"):
+            qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+            target = urllib.parse.unquote(qs.get("url", [""])[0])
+            if not target.startswith("https://paper-api.alpaca.markets") and \
+               not target.startswith("https://data.alpaca.markets"):
+                self.send_error(403, "Proxy only allows Alpaca endpoints")
+                return
+            req = urllib.request.Request(target, headers={
+                "APCA-API-KEY-ID":     os.getenv("ALPACA_API_KEY", ""),
+                "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY", ""),
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+            except urllib.error.HTTPError as e:
+                body = e.read()
+                self.send_response(e.code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_error(502, str(e))
             return
 
         super().do_GET()
