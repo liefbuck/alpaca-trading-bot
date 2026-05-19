@@ -10,19 +10,39 @@ import logging
 log = logging.getLogger(__name__)
 
 
+# Add any tickers you want tracked beyond the S&P 500 here.
+WATCHLIST: list[str] = [
+    "XE",
+]
+
+
 def get_sp500() -> list:
     """Pull current S&P 500 tickers from Wikipedia."""
+    import requests
+    from io import StringIO
     try:
-        table = pd.read_html(
+        resp = requests.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            attrs={"id": "constituents"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
+            timeout=15,
         )
+        resp.raise_for_status()
+        table = pd.read_html(StringIO(resp.text), attrs={"id": "constituents"})
         tickers = table[0]["Symbol"].tolist()
         # Wikipedia uses dots (BRK.B), yfinance needs dashes (BRK-B)
         return [t.replace(".", "-") for t in tickers]
     except Exception as e:
         log.warning(f"Could not fetch S&P 500 list: {e}. Falling back to built-in list.")
         return FALLBACK
+
+
+def get_universe() -> list:
+    """S&P 500 + any extra tickers in WATCHLIST, deduplicated."""
+    base = get_sp500()
+    extras = [t for t in WATCHLIST if t not in base]
+    if extras:
+        log.info(f"Adding {len(extras)} watchlist ticker(s) to universe: {extras}")
+    return base + extras
 
 
 def get_top_momentum(n: int = 50) -> list:
@@ -33,7 +53,7 @@ def get_top_momentum(n: int = 50) -> list:
     consistently rising — early 10 days vs recent 10 days comparison.
     Batch-downloads 30 days so all three signals are available at once.
     """
-    universe = get_sp500()
+    universe = get_universe()
     log.info(f"Downloading {len(universe)} tickers for momentum scan (30d)...")
 
     try:
@@ -56,7 +76,7 @@ def get_top_momentum(n: int = 50) -> list:
             if symbol not in raw.columns.get_level_values(0):
                 continue
             df = raw[symbol].dropna()
-            if len(df) < 20:
+            if len(df) < 5:
                 continue
 
             prev_close = float(df["Close"].iloc[-2])
@@ -81,7 +101,7 @@ def get_top_momentum(n: int = 50) -> list:
             rel_vol    = vol_today / vol_avg
 
             # Score = gap% x today's relative vol x 30-day vol trend
-            score = change_pct * rel_vol * vol_trend
+            score = change_pct * (rel_vol ** 1.25) * vol_trend
 
             candidates.append({
                 "symbol":     symbol,
@@ -108,7 +128,7 @@ def get_top_mean_reversion(n: int = 50) -> list:
     Return up to n tickers with RSI < 30 and price below 20-day SMA.
     Needs more history, so uses a 60-day download.
     """
-    universe = get_sp500()
+    universe = get_universe()
     log.info(f"Downloading {len(universe)} tickers for mean reversion scan...")
 
     try:
@@ -131,7 +151,8 @@ def get_top_mean_reversion(n: int = 50) -> list:
             if symbol not in raw.columns.get_level_values(0):
                 continue
             closes = raw[symbol]["Close"].dropna()
-            if len(closes) < 35:
+            # Need at least 20 rows for SMA-20 and 15 for RSI-14 to be valid
+            if len(closes) < 20:
                 continue
             current   = float(closes.iloc[-1])
             sma       = float(closes.rolling(20).mean().iloc[-1])
