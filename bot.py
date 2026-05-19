@@ -11,6 +11,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from screener import get_top_momentum
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_POSITION_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET
 
 load_dotenv()
 
@@ -25,10 +26,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
-DAILY_TARGET = 200.0
-DAILY_LOSS_LIMIT = -300.0
-PER_POSITION_LOSS_LIMIT = -150.0
-MAX_POSITIONS = 10
 STATE_FILE = "bot_state.json"
 PERF_FILE  = "performance_log.json"
 

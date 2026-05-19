@@ -2,6 +2,9 @@
 import http.server
 import json
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP, MAX_POSITIONS, PER_POSITION_TARGET
 
 PORT = 5000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,6 +30,44 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "momentum":      tail(os.path.join(BASE_DIR, "bot.log")),
                 "mean_reversion": tail(os.path.join(BASE_DIR, "mean_reversion.log")),
             }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path == "/performance":
+            perf_path = os.path.join(BASE_DIR, "performance_log.json")
+            history = []
+            if os.path.exists(perf_path):
+                with open(perf_path) as f:
+                    history = json.load(f)
+            data = json.dumps(history).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path == "/config":
+            state = {}
+            state_path = os.path.join(BASE_DIR, "bot_state.json")
+            if os.path.exists(state_path):
+                with open(state_path) as f:
+                    state = json.load(f)
+            cfg = {
+                "daily_target":         DAILY_TARGET,
+                "daily_loss_limit":     DAILY_LOSS_LIMIT,
+                "per_position_stop":    PER_POSITION_STOP,
+                "per_position_target":  PER_POSITION_TARGET,
+                "max_positions":        MAX_POSITIONS,
+                "session_baseline":     state.get("session_baseline"),
+            }
+            data = json.dumps(cfg).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))

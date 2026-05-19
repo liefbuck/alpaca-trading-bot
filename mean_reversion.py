@@ -20,6 +20,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from screener import get_top_mean_reversion
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_STOP, MAX_POSITIONS, PER_POSITION_TARGET as PER_TARGET
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -35,12 +36,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
-
-DAILY_TARGET      = 200.0
-DAILY_LOSS_LIMIT  = -300.0
-MAX_POSITIONS     = 10
-PER_TARGET        = DAILY_TARGET / MAX_POSITIONS   # $40 per position
-PER_STOP          = -150.0                            # per-position stop, independent of daily limit
 
 RSI_PERIOD    = 14
 RSI_OVERSOLD  = 30   # entry threshold
