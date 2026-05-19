@@ -9,6 +9,7 @@ import os
 import json
 import time
 import schedule
+import pandas as pd
 import yfinance as yf
 from datetime import datetime
 import pytz
@@ -36,10 +37,10 @@ log = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
 
 DAILY_TARGET      = 200.0
-DAILY_LOSS_LIMIT  = -100.0
-MAX_POSITIONS     = 5
+DAILY_LOSS_LIMIT  = -300.0
+MAX_POSITIONS     = 10
 PER_TARGET        = DAILY_TARGET / MAX_POSITIONS   # $40 per position
-PER_STOP          = DAILY_LOSS_LIMIT / MAX_POSITIONS  # -$20 per position
+PER_STOP          = -150.0                            # per-position stop, independent of daily limit
 
 RSI_PERIOD    = 14
 RSI_OVERSOLD  = 30   # entry threshold
@@ -75,9 +76,36 @@ def is_market_open() -> bool:
     return clock.is_open
 
 
+# Shared with the momentum bot for session baseline / daily P&L tracking.
+SHARED_STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+# Own state file tracking only positions this bot opened.
+MR_STATE_FILE = os.path.join(BASE_DIR, "mr_state.json")
+
+
+def load_state() -> dict:
+    if os.path.exists(SHARED_STATE_FILE):
+        with open(SHARED_STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def load_mr_state() -> dict:
+    if os.path.exists(MR_STATE_FILE):
+        with open(MR_STATE_FILE) as f:
+            return json.load(f)
+    return {"positions": []}
+
+
+def save_mr_state(data: dict):
+    with open(MR_STATE_FILE, "w") as f:
+        json.dump(data, f)
+
+
 def get_daily_pnl() -> float:
     acct = client.get_account()
-    return float(acct.equity) - float(acct.last_equity)
+    state = load_state()
+    baseline = state.get("session_baseline") or float(acct.last_equity)
+    return float(acct.equity) - baseline
 
 
 def scan_mean_reversion() -> list:
@@ -110,16 +138,19 @@ def open_positions():
         trading_active = False
         return
 
-    existing = client.get_all_positions()
-    held = {p.symbol for p in existing}
-    slots = MAX_POSITIONS - len(existing)
+    mr_state = load_mr_state()
+    owned = set(mr_state.get("positions", []))
+    slots = MAX_POSITIONS - len(owned)
     if slots <= 0:
-        log.info("All position slots filled.")
+        log.info("All mean-reversion slots filled.")
         return
+
+    # Also avoid symbols already held by the momentum bot
+    all_held = {p.symbol for p in client.get_all_positions()}
 
     log.info("Scanning for oversold mean-reversion setups...")
     signals = scan_mean_reversion()
-    signals = [s for s in signals if s["symbol"] not in held][:slots]
+    signals = [s for s in signals if s["symbol"] not in all_held][:slots]
 
     if not signals:
         log.info("No qualifying oversold stocks found.")
@@ -138,8 +169,12 @@ def open_positions():
                 f"BUY {qty}x {stock['symbol']} @ ~${stock['price']} "
                 f"| RSI={stock['rsi']} | {stock['pct_below']}% below SMA"
             )
+            owned.add(stock["symbol"])
         except Exception as e:
             log.error(f"Order failed {stock['symbol']}: {e}")
+
+    mr_state["positions"] = list(owned)
+    save_mr_state(mr_state)
 
 
 def check_exits():
@@ -150,14 +185,22 @@ def check_exits():
 
     # Daily kill switch
     daily_pnl = get_daily_pnl()
+    log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
     if daily_pnl <= DAILY_LOSS_LIMIT:
         log.info(f"DAILY LOSS LIMIT ${daily_pnl:.2f} — closing everything.")
         client.close_all_positions(cancel_orders=True)
         trading_active = False
         return
 
-    positions = client.get_all_positions()
+    mr_state = load_mr_state()
+    owned = set(mr_state.get("positions", []))
+
+    positions = [p for p in client.get_all_positions() if p.symbol in owned]
     for pos in positions:
+        # Skip if a close order is already pending (shares held for orders)
+        if float(pos.qty_available) <= 0:
+            log.info(f"  {pos.symbol}  close order pending, skipping.")
+            continue
         pl     = float(pos.unrealized_pl)
         symbol = pos.symbol
 
@@ -170,25 +213,40 @@ def check_exits():
         except Exception:
             pass
 
+        closed = False
         if pl >= PER_TARGET:
             log.info(f"TARGET HIT {symbol} +${pl:.2f} — closing.")
             client.close_position(symbol)
+            closed = True
         elif pl <= PER_STOP:
             log.info(f"STOP HIT {symbol} ${pl:.2f} — closing.")
             client.close_position(symbol)
+            closed = True
         elif rsi_recovered:
             log.info(f"RSI RECOVERED {symbol} RSI>={RSI_EXIT}, P&L=${pl:.2f} — closing.")
             client.close_position(symbol)
+            closed = True
         else:
             log.info(f"  {symbol}  P&L ${pl:+.2f}  (target +${PER_TARGET:.0f} | stop ${PER_STOP:.0f})")
 
+        if closed:
+            owned.discard(symbol)
+
+    mr_state["positions"] = list(owned)
+    save_mr_state(mr_state)
+
 
 def eod_close():
-    log.info("EOD: Closing all mean-reversion positions.")
-    try:
-        client.close_all_positions(cancel_orders=True)
-    except Exception as e:
-        log.error(f"EOD close error: {e}")
+    log.info("EOD: Closing mean-reversion positions.")
+    mr_state = load_mr_state()
+    for symbol in mr_state.get("positions", []):
+        try:
+            client.close_position(symbol)
+            log.info(f"EOD closed {symbol}")
+        except Exception as e:
+            log.error(f"EOD close error {symbol}: {e}")
+    mr_state["positions"] = []
+    save_mr_state(mr_state)
     global trading_active
     trading_active = False
 
@@ -200,6 +258,15 @@ def daily_reset():
     if not clock.is_open:
         return
     trading_active = True
+    # Refresh session_baseline so daily P&L starts from today's open equity
+    acct = client.get_account()
+    state = load_state()
+    state["session_baseline"] = float(acct.equity)
+    state["date"] = str(datetime.now(ET).date())
+    state["trades_today"] = []
+    with open(SHARED_STATE_FILE, "w") as f:
+        json.dump(state, f)
+    save_mr_state({"positions": []})
     log.info("=" * 40)
     log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
     log.info("=" * 40)
@@ -209,7 +276,7 @@ def daily_reset():
 schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
 schedule.every().day.at("11:00").do(open_positions)    # First scan
 schedule.every().day.at("13:00").do(open_positions)    # Second scan if slots remain
-schedule.every(3).minutes.do(check_exits)              # P&L check every 3 min
+schedule.every(1).minutes.do(check_exits)               # P&L check every 1 min
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
 if __name__ == "__main__":

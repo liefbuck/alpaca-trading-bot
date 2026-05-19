@@ -26,9 +26,11 @@ log = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
 DAILY_TARGET = 200.0
-DAILY_LOSS_LIMIT = -100.0
-MAX_POSITIONS = 5
+DAILY_LOSS_LIMIT = -300.0
+PER_POSITION_LOSS_LIMIT = -150.0
+MAX_POSITIONS = 10
 STATE_FILE = "bot_state.json"
+PERF_FILE  = "performance_log.json"
 
 client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
@@ -53,7 +55,19 @@ def load_state() -> dict:
 
 def get_daily_pnl() -> float:
     acct = client.get_account()
-    return float(acct.equity) - float(acct.last_equity)
+    state = load_state()
+    baseline = state.get("session_baseline") or float(acct.last_equity)
+    return float(acct.equity) - baseline
+
+
+def reset_session():
+    """Reset daily P&L tracking to current equity so today starts fresh."""
+    acct = client.get_account()
+    baseline = float(acct.equity)
+    state = load_state()
+    state["session_baseline"] = baseline
+    save_state(state)
+    log.info(f"Session reset — new baseline equity: ${baseline:.2f}")
 
 
 def get_account():
@@ -103,7 +117,8 @@ def open_positions():
         return
 
     # Check if we already have open positions — don't stack
-    existing = client.get_all_positions()
+    # Exclude positions with a pending close order (qty_available == 0)
+    existing = [p for p in client.get_all_positions() if float(p.qty_available) > 0]
     if existing:
         log.info(f"Already holding {len(existing)} position(s), skipping entry.")
         return
@@ -128,13 +143,27 @@ def open_positions():
         except Exception as e:
             log.error(f"Order failed {stock['symbol']}: {e}")
 
-    save_state({"date": str(datetime.now(ET).date()), "positions": bought})
+    state = load_state()
+    state["date"] = str(datetime.now(ET).date())
+    state["positions"] = bought
+    save_state(state)
 
 
-def close_position(symbol: str):
+def record_trade(symbol: str, pl: float):
+    """Append a closed trade result to today's state for EOD summary."""
+    state = load_state()
+    trades = state.get("trades_today", [])
+    trades.append({"symbol": symbol, "pl": round(pl, 2)})
+    state["trades_today"] = trades
+    save_state(state)
+
+
+def close_position(symbol: str, pl: float = None):
     try:
         client.close_position(symbol)
         log.info(f"Closed position: {symbol}")
+        if pl is not None:
+            record_trade(symbol, pl)
     except Exception as e:
         log.error(f"Error closing {symbol}: {e}")
 
@@ -156,33 +185,76 @@ def check_pnl():
     if not is_market_open():
         return
 
-    per_position_target = DAILY_TARGET / MAX_POSITIONS      # ~$67
-    per_position_limit  = DAILY_LOSS_LIMIT / MAX_POSITIONS  # ~-$33
+    per_position_target = DAILY_TARGET / MAX_POSITIONS      # ~$40
+
+    daily_pnl = get_daily_pnl()
+    log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
 
     positions = client.get_all_positions()
     for pos in positions:
+        # Skip if a close order is already pending (shares held for orders)
+        if float(pos.qty_available) <= 0:
+            log.info(f"  {pos.symbol}  close order pending, skipping.")
+            continue
         pl = float(pos.unrealized_pl)
         symbol = pos.symbol
         if pl >= per_position_target:
             log.info(f"TARGET HIT {symbol} +${pl:.2f} — closing.")
-            close_position(symbol)
-        elif pl <= per_position_limit:
+            close_position(symbol, pl)
+        elif pl <= PER_POSITION_LOSS_LIMIT:
             log.info(f"LOSS LIMIT {symbol} ${pl:.2f} — closing.")
-            close_position(symbol)
+            close_position(symbol, pl)
         else:
-            log.info(f"  {symbol}  P&L ${pl:+.2f}  (target ${per_position_target:.0f} | limit ${per_position_limit:.0f})")
+            log.info(f"  {symbol}  P&L ${pl:+.2f}  (target ${per_position_target:.0f} | limit ${PER_POSITION_LOSS_LIMIT:.0f})")
 
     # Kill switch: stop trading for the day if total daily loss is too deep
-    daily_pnl = get_daily_pnl()
     if daily_pnl <= DAILY_LOSS_LIMIT:
         log.info(f"DAILY LOSS LIMIT HIT ${daily_pnl:.2f} — halting for the day.")
         close_all()
         trading_active = False
 
 
+def log_daily_performance():
+    """Append today's summary to performance_log.json."""
+    state = load_state()
+    trades = state.get("trades_today", [])
+    daily_pnl = get_daily_pnl()
+    wins  = [t for t in trades if t["pl"] > 0]
+    losses = [t for t in trades if t["pl"] <= 0]
+
+    entry = {
+        "date":        str(datetime.now(ET).date()),
+        "daily_pnl":   round(daily_pnl, 2),
+        "trades":      len(trades),
+        "wins":        len(wins),
+        "losses":      len(losses),
+        "win_rate":    round(len(wins) / len(trades) * 100, 1) if trades else 0,
+        "best_trade":  round(max((t["pl"] for t in trades), default=0), 2),
+        "worst_trade": round(min((t["pl"] for t in trades), default=0), 2),
+        "result":      "WIN" if daily_pnl > 0 else "LOSS",
+    }
+
+    log = logging.getLogger(__name__)
+    log.info(f"EOD Summary: {entry}")
+
+    history = []
+    if os.path.exists(PERF_FILE):
+        with open(PERF_FILE) as f:
+            history = json.load(f)
+
+    # Replace today's entry if it already exists, otherwise append
+    history = [h for h in history if h["date"] != entry["date"]]
+    history.append(entry)
+    history.sort(key=lambda x: x["date"])
+
+    with open(PERF_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+
 def eod_close():
     log.info("EOD: Force-closing all positions.")
     close_all()
+    log_daily_performance()
     global trading_active
     trading_active = False
 
@@ -194,15 +266,34 @@ def daily_reset():
     if not clock.is_open:
         return  # Only reset on actual trading days
     trading_active = True
+    reset_session()
+    state = load_state()
+    state["date"] = str(datetime.now(ET).date())
+    state["positions"] = []
+    state["trades_today"] = []
+    save_state(state)
     log.info("=" * 40)
     log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
     log.info("=" * 40)
 
 
+def close_overnight():
+    """Close any positions held overnight before the fresh morning scan."""
+    positions = client.get_all_positions()
+    if not positions:
+        return
+    log.info(f"Closing {len(positions)} overnight position(s) before morning scan...")
+    for pos in positions:
+        pl = float(pos.unrealized_pl)
+        log.info(f"  Closing overnight {pos.symbol}  P&L ${pl:+.2f}")
+    close_all()
+
+
 # ── Schedule ─────────────────────────────────────────────────────────────────
 schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
+schedule.every().day.at("09:31").do(close_overnight)   # Close any overnight positions
 schedule.every().day.at("09:35").do(open_positions)    # Enter 5 min after open
-schedule.every(3).minutes.do(check_pnl)                # P&L check every 3 min
+schedule.every(1).minutes.do(check_pnl)                 # P&L check every 1 min
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
 if __name__ == "__main__":
