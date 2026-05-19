@@ -1,10 +1,9 @@
 @echo off
-echo Starting BOTH BOTS...
-echo Momentum:      top 5 gap-up movers at 9:35 AM
-echo Mean Reversion: RSI under 30 stocks at 11am and 1pm
+echo Starting Momentum Bot + Dashboard...
+echo Momentum: top 10 gap-up movers at 9:35 AM
+echo Mean Reversion: disabled (run start_meanreversion.bat to enable)
 echo.
 start "Momentum Bot" python bot.py
-start "Mean Reversion Bot" python mean_reversion.py
 start "Dashboard" python serve.py
 timeout /t 2 /nobreak >nul
 start http://localhost:5000/dashboard.html
