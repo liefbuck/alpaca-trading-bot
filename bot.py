@@ -332,5 +332,8 @@ if __name__ == "__main__":
     else:
         log.info(f"Startup: using existing baseline ${state['session_baseline']:.2f} for {today}")
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            log.error(f"Scheduler error (continuing): {e}")
         time.sleep(30)

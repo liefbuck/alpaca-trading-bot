@@ -288,5 +288,8 @@ if __name__ == "__main__":
     log.info(f"Exit:  +${PER_TARGET:.0f} target | ${PER_STOP:.0f} stop | RSI >= {RSI_EXIT} recovery")
     log.info("=" * 60)
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            log.error(f"Scheduler error (continuing): {e}")
         time.sleep(30)
