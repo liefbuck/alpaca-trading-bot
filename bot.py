@@ -309,7 +309,7 @@ def close_overnight():
 schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
 schedule.every().day.at("09:31").do(close_overnight)   # Close any overnight positions
 schedule.every().day.at("09:33").do(open_positions)    # Enter 3 min after open
-schedule.every(1).minutes.do(check_pnl)                 # P&L check every 1 min
+schedule.every(30).seconds.do(check_pnl)                # P&L check every 30 sec
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
 if __name__ == "__main__":
