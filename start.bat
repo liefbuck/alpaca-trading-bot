@@ -5,8 +5,7 @@ taskkill /F /IM python3.exe >nul 2>&1
 ping -n 3 127.0.0.1 >nul
 
 echo Starting Momentum Bot + Dashboard...
-echo Momentum: top 10 gap-up movers at 9:35 AM
-echo Mean Reversion: disabled (run start_meanreversion.bat to enable)
+echo Strategy: top gap-up movers from S&P 500 + Nasdaq 100 at 9:33 AM
 echo.
 start "Momentum Bot" python bot.py
 start "Dashboard" python serve.py

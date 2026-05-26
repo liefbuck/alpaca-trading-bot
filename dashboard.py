@@ -6,7 +6,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -58,20 +59,32 @@ def get_all_positions():
 
 def get_account():
     acct = trading_client.get_account()
-    daily_pnl = float(acct.equity) - float(acct.last_equity)
+    # Use session_baseline from bot_state.json so P&L matches what the bot tracks.
+    # Fall back to last_equity only if no baseline has been set yet today.
+    state_path = os.path.join(BASE_DIR, "bot_state.json")
+    baseline = None
+    if os.path.exists(state_path):
+        try:
+            with open(state_path) as f:
+                baseline = json.load(f).get("session_baseline")
+        except Exception:
+            pass
+    if baseline is None:
+        baseline = float(acct.last_equity)
+    daily_pnl = float(acct.equity) - baseline
     return {
         "cash": float(acct.cash),
         "portfolio_value": float(acct.portfolio_value),
         "buying_power": float(acct.buying_power),
         "equity": float(acct.equity),
         "daily_pnl": round(daily_pnl, 2),
-        "daily_pnl_pct": round(daily_pnl / float(acct.last_equity) * 100, 3) if float(acct.last_equity) else 0,
+        "daily_pnl_pct": round(daily_pnl / baseline * 100, 3) if baseline else 0,
     }
 
 
 def get_bars(symbol, days=30):
     try:
-        end = datetime.utcnow()
+        end = datetime.now(timezone.utc)
         start = end - timedelta(days=days)
         bars = data_client.get_stock_bars(
             StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end)
@@ -105,7 +118,6 @@ def index():
 
 @app.route("/api/status")
 def status():
-    import traceback
     try:
         account = get_account()
         positions = get_all_positions()
@@ -120,15 +132,15 @@ def status():
             "t_bars": t_bars,
             "bot_state": bot_state,
             "bot_log": bot_log,
-            "daily_target": 200,
-            "daily_loss_limit": -100,
+            "daily_target": DAILY_TARGET,
+            "daily_loss_limit": DAILY_LOSS_LIMIT,
         })
     except Exception as e:
-        tb = traceback.format_exc()
-        print("ERROR in /api/status:\n", tb)
-        return jsonify({"error": str(e), "traceback": tb}), 500
+        # Log internally but never expose tracebacks over HTTP
+        print(f"ERROR in /api/status: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
     print("Dashboard running at http://localhost:5000")
-    app.run(debug=True, port=5000, use_reloader=False)
+    app.run(debug=False, port=5000, use_reloader=False)

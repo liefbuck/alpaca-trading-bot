@@ -32,7 +32,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path == "/logs":
             data = json.dumps({
                 "momentum":      tail(os.path.join(BASE_DIR, "bot.log")),
-                "mean_reversion": tail(os.path.join(BASE_DIR, "mean_reversion.log")),
+                "mean_reversion": tail(os.path.join(BASE_DIR, "_archived", "mean_reversion.log")),
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -86,8 +86,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path.startswith("/proxy?"):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
             target = urllib.parse.unquote(qs.get("url", [""])[0])
-            if not target.startswith("https://paper-api.alpaca.markets") and \
-               not target.startswith("https://data.alpaca.markets"):
+            parsed_target = urllib.parse.urlparse(target)
+            if parsed_target.hostname not in ("paper-api.alpaca.markets", "data.alpaca.markets"):
                 self.send_error(403, "Proxy only allows Alpaca endpoints")
                 return
             req = urllib.request.Request(target, headers={
@@ -112,6 +112,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(502, str(e))
             return
 
+        # Block sensitive files from static serving
+        BLOCKED_FILES = {".env", "bot_state.json", "bot.log", "mr_state.json",
+                         "performance_log.json", "watchdog.log"}
+        bare_path = self.path.split("?")[0].lstrip("/")
+        if bare_path in BLOCKED_FILES or bare_path.startswith("."):
+            self.send_error(403, "Forbidden")
+            return
         super().do_GET()
 
     def log_message(self, format, *args):

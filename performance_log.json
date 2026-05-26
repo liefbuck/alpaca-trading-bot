@@ -1,0 +1,46 @@
+[
+  {
+    "date": "2026-05-19",
+    "daily_pnl": -139.35,
+    "trades": 1,
+    "wins": 0,
+    "losses": 1,
+    "win_rate": 0.0,
+    "best_trade": -5.7,
+    "worst_trade": -5.7,
+    "result": "LOSS"
+  },
+  {
+    "date": "2026-05-20",
+    "daily_pnl": 148.81,
+    "trades": 10,
+    "wins": 9,
+    "losses": 1,
+    "win_rate": 90.0,
+    "best_trade": 35.77,
+    "worst_trade": -113.63,
+    "result": "WIN"
+  },
+  {
+    "date": "2026-05-21",
+    "daily_pnl": -12.0,
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0,
+    "best_trade": 0,
+    "worst_trade": 0,
+    "result": "LOSS"
+  },
+  {
+    "date": "2026-05-22",
+    "daily_pnl": 0.0,
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0,
+    "best_trade": 0,
+    "worst_trade": 0,
+    "result": "LOSS"
+  }
+]

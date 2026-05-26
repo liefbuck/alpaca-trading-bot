@@ -4,6 +4,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from screener import get_top_momentum
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -13,10 +14,12 @@ client = TradingClient(
     paper=True,
 )
 
-DAILY_TARGET  = 200
-MAX_POSITIONS = 5
+clock = client.get_clock()
+if not clock.is_open:
+    print(f"Market is closed. Next open: {clock.next_open}")
+    exit()
 
-print("Scanning full S&P 500 for momentum plays...\n")
+print("Scanning S&P 500 + Nasdaq 100 for momentum plays...\n")
 top = get_top_momentum(n=50)
 
 if not top:
@@ -33,8 +36,7 @@ buying_power = float(acct.buying_power)
 
 print("\n=== PLACING ORDERS ===")
 for stock in picks:
-    target_per_pos    = DAILY_TARGET / MAX_POSITIONS
-    shares_for_target = int(target_per_pos / (stock["price"] * 0.01))
+    shares_for_target = int(PER_POSITION_TARGET / (stock["price"] * 0.01))
     max_affordable    = int((buying_power / MAX_POSITIONS) / stock["price"])
     qty = max(1, min(shares_for_target, max_affordable))
     try:
@@ -48,4 +50,4 @@ for stock in picks:
     except Exception as e:
         print(f"  FAILED {stock['symbol']}: {e}")
 
-print("\nDone. Watching for +$200 daily target or -$100 loss limit.")
+print(f"\nDone. Target +${DAILY_TARGET:.0f} | Loss limit ${DAILY_LOSS_LIMIT:.0f}")

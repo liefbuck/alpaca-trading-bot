@@ -10,26 +10,28 @@ from dotenv import load_dotenv
 import yfinance as yf
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_POSITION_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET
 
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler("bot.log"),
+        logging.FileHandler(os.path.join(BASE_DIR, "bot.log")),
         logging.StreamHandler(),
     ],
 )
 log = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
-STATE_FILE = "bot_state.json"
-PERF_FILE  = "performance_log.json"
+STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
+PERF_FILE  = os.path.join(BASE_DIR, "performance_log.json")
 
 client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
@@ -38,24 +40,41 @@ client = TradingClient(
 )
 
 trading_active = True
+_last_api_error_log: float = 0.0   # epoch seconds — rate-limits repeated DNS error logs
 
 
 def save_state(data: dict):
-    with open(STATE_FILE, "w") as f:
+    # Write to a temp file then replace atomically — prevents corrupt state on crash/kill.
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, STATE_FILE)
 
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            log.warning(f"State file unreadable ({e}) — starting fresh.")
+            return {}
     return {}
+
+
+def persist_halted(halted: bool):
+    """Persist the trading_active flag so a restart doesn't resume after a loss-limit halt."""
+    state = load_state()
+    state["trading_halted"] = halted
+    save_state(state)
 
 
 def get_daily_pnl() -> float:
     acct = client.get_account()
     state = load_state()
-    baseline = state.get("session_baseline") or float(acct.last_equity)
+    baseline = state.get("session_baseline")
+    if baseline is None:
+        baseline = float(acct.last_equity)
     return float(acct.equity) - baseline
 
 
@@ -74,10 +93,17 @@ def get_account():
 
 
 def is_market_open() -> bool:
-    clock = client.get_clock()
+    global _last_api_error_log
+    try:
+        clock = client.get_clock()
+    except Exception as e:
+        now_ts = time.time()
+        if now_ts - _last_api_error_log > 300:  # log at most once every 5 minutes
+            log.warning(f"Alpaca API unreachable (network issue?): {e}")
+            _last_api_error_log = now_ts
+        return False  # treat as market closed so nothing dangerous runs
     if not clock.is_open:
         now = datetime.now(ET)
-        # Suppress noisy weekend logging — only log once per hour
         if now.minute == 0:
             log.info(f"Market closed ({now.strftime('%A %H:%M ET')}). Next open: {clock.next_open}")
     return clock.is_open
@@ -100,15 +126,14 @@ def spy_is_positive() -> bool:
 
 
 def scan_momentum() -> list:
-    """Scan the full S&P 500 for top momentum plays."""
+    """Scan S&P 500 + Nasdaq 100 + watchlist for top momentum plays."""
     top = get_top_momentum(n=50)
     log.info(f"Top movers: {[(c['symbol'], c['change_pct']) for c in top[:5]]}")
     return top[:MAX_POSITIONS]
 
 
-def position_size(price: float) -> int:
-    acct = get_account()
-    buying_power = float(acct.buying_power) / MAX_POSITIONS
+def position_size(price: float, buying_power: float) -> int:
+    """Calculate share quantity. buying_power should be per-position buying power."""
     shares_for_target = int(PER_POSITION_TARGET / (price * 0.01))
     max_affordable = int(buying_power / price)
     return max(1, min(shares_for_target, max_affordable))
@@ -116,8 +141,17 @@ def position_size(price: float) -> int:
 
 def open_positions():
     global trading_active
+    if not trading_active:
+        log.info("Trading halted — skipping entry.")
+        return
     if not is_market_open():
         log.info("Market not open, skipping entry.")
+        return
+
+    now_et = datetime.now(ET)
+    entry_cutoff = now_et.replace(hour=12, minute=0, second=0, microsecond=0)
+    if now_et >= entry_cutoff:
+        log.info("Past noon — entry window closed for today.")
         return
 
     pnl = get_daily_pnl()
@@ -127,6 +161,7 @@ def open_positions():
     if pnl <= DAILY_LOSS_LIMIT:
         log.info(f"Loss limit already hit (${pnl:.2f}). No new entries.")
         trading_active = False
+        persist_halted(True)
         return
 
     # Market direction filter: skip momentum buys on down-market days
@@ -146,9 +181,13 @@ def open_positions():
         log.info("No qualifying momentum stocks found today.")
         return
 
+    # Fetch account once — don't call Alpaca once per stock in the loop
+    acct = get_account()
+    per_pos_buying_power = float(acct.buying_power) / MAX_POSITIONS
+
     bought = []
     for stock in top:
-        qty = position_size(stock["price"])
+        qty = position_size(stock["price"], per_pos_buying_power)
         try:
             order = client.submit_order(MarketOrderRequest(
                 symbol=stock["symbol"],
@@ -181,19 +220,29 @@ def close_position(symbol: str, pl: float = None):
         pos = client.get_open_position(symbol)
         entry_price = float(pos.avg_entry_price)
         qty = float(pos.qty)
+        submitted_at = datetime.now(ET)
         client.close_position(symbol)
         log.info(f"Closed position: {symbol}")
-        # Wait briefly for the fill, then record actual realized P&L
-        time.sleep(1)
+        # Best-effort: check if fill is already available (no sleep — don't block scheduler).
+        # IMPORTANT: only accept sell orders submitted TODAY to avoid picking up stale
+        # historical fills which produce completely wrong P&L numbers.
         try:
-            from alpaca.trading.requests import GetOrdersRequest
-            from alpaca.trading.enums import QueryOrderStatus
             orders = client.get_orders(GetOrdersRequest(
                 status=QueryOrderStatus.CLOSED,
                 symbols=[symbol],
-                limit=5,
+                limit=10,
             ))
-            sell = next((o for o in orders if o.side.value == "sell" and o.filled_avg_price), None)
+            today = submitted_at.date()
+            sell = next(
+                (
+                    o for o in orders
+                    if o.side.value == "sell"
+                    and o.filled_avg_price
+                    and o.submitted_at is not None
+                    and o.submitted_at.astimezone(ET).date() == today
+                ),
+                None,
+            )
             if sell:
                 actual_pl = (float(sell.filled_avg_price) - entry_price) * qty
                 logged = f"${pl:.2f}" if pl is not None else "n/a"
@@ -250,6 +299,7 @@ def check_pnl():
         log.info(f"DAILY LOSS LIMIT HIT ${daily_pnl:.2f} — halting for the day.")
         close_all()
         trading_active = False
+        persist_halted(True)
 
 
 def log_daily_performance():
@@ -276,30 +326,54 @@ def log_daily_performance():
 
     history = []
     if os.path.exists(PERF_FILE):
-        with open(PERF_FILE) as f:
-            history = json.load(f)
+        try:
+            with open(PERF_FILE) as f:
+                history = json.load(f)
+        except Exception as e:
+            log.warning(f"performance_log.json unreadable ({e}) — starting fresh history.")
+            history = []
 
     # Replace today's entry if it already exists, otherwise append
     history = [h for h in history if h["date"] != entry["date"]]
     history.append(entry)
     history.sort(key=lambda x: x["date"])
 
-    with open(PERF_FILE, "w") as f:
+    # Atomic write — prevents corrupt file if process is killed mid-write
+    tmp = PERF_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(history, f, indent=2)
+    os.replace(tmp, PERF_FILE)
 
 
 def eod_close():
     log.info("EOD: Force-closing all positions.")
+    # Record each open position's unrealized P&L before the bulk close
+    # so the performance log has accurate trade-level data.
+    try:
+        for pos in client.get_all_positions():
+            pl = float(pos.unrealized_pl)
+            log.info(f"  EOD recording {pos.symbol} P&L ${pl:+.2f}")
+            record_trade(pos.symbol, pl)
+    except Exception as e:
+        log.error(f"EOD trade recording error: {e}")
     close_all()
-    log_daily_performance()
+    try:
+        log_daily_performance()
+    except Exception as e:
+        log.error(f"EOD: failed to write performance log ({e}) — continuing shutdown.")
     global trading_active
     trading_active = False
+    persist_halted(False)  # Reset for next day
 
 
 def daily_reset():
     """Reset state at the start of each trading day."""
     global trading_active
-    clock = client.get_clock()
+    try:
+        clock = client.get_clock()
+    except Exception as e:
+        log.error(f"daily_reset: could not reach Alpaca ({e}) — skipping reset.")
+        return
     # Guard: skip weekends/holidays by checking next open is today
     now = datetime.now(ET)
     if clock.next_open.date() != now.date() and not clock.is_open:
@@ -310,6 +384,7 @@ def daily_reset():
     state["date"] = str(datetime.now(ET).date())
     state["positions"] = []
     state["trades_today"] = []
+    state["trading_halted"] = False
     save_state(state)
     log.info("=" * 40)
     log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
@@ -318,28 +393,56 @@ def daily_reset():
 
 def close_overnight():
     """Close any positions held overnight before the fresh morning scan."""
-    positions = client.get_all_positions()
+    try:
+        positions = client.get_all_positions()
+    except Exception as e:
+        log.error(f"close_overnight: could not fetch positions ({e})")
+        return
     if not positions:
         return
     log.info(f"Closing {len(positions)} overnight position(s) before morning scan...")
     for pos in positions:
         pl = float(pos.unrealized_pl)
         log.info(f"  Closing overnight {pos.symbol}  P&L ${pl:+.2f}")
+        record_trade(pos.symbol, pl)   # record so overnight closes appear in performance log
     close_all()
 
 
 # ── Schedule ─────────────────────────────────────────────────────────────────
 schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
 schedule.every().day.at("09:31").do(close_overnight)   # Close any overnight positions
-schedule.every().day.at("09:33").do(open_positions)    # Enter 3 min after open
-schedule.every(30).seconds.do(check_pnl)                # P&L check every 30 sec
+schedule.every(10).seconds.do(check_pnl)               # P&L check every 10 sec
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
+
+# Entry attempts every 15 min from 9:33 to 11:48 — stops after noon or once positions are open
+for _t in ["09:33", "09:48", "10:03", "10:18", "10:33", "10:48",
+           "11:03", "11:18", "11:33", "11:48"]:
+    schedule.every().day.at(_t).do(open_positions)
+
+def wait_for_network(max_wait_seconds: int = 300, interval: int = 15):
+    """Block until Alpaca API is reachable. Handles slow network on morning boot."""
+    deadline = time.time() + max_wait_seconds
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            client.get_clock()
+            if attempt > 1:
+                log.info(f"Network ready after {attempt} attempt(s).")
+            return
+        except Exception as e:
+            remaining = int(deadline - time.time())
+            log.warning(f"Network not ready (attempt {attempt}, {remaining}s remaining): {e}")
+            time.sleep(interval)
+    log.error("Alpaca API still unreachable after startup wait — continuing anyway.")
+
 
 if __name__ == "__main__":
     log.info("=" * 60)
     log.info("Trading bot started")
     log.info(f"Daily target: ${DAILY_TARGET} | Loss limit: ${DAILY_LOSS_LIMIT}")
     log.info("=" * 60)
+    wait_for_network()
     # On startup: if state file has no baseline for today, reset it now so
     # check_pnl doesn't immediately see a stale loss and kill trading.
     state = load_state()
@@ -349,14 +452,35 @@ if __name__ == "__main__":
         reset_session()
         state = load_state()
         state["date"] = today
-        state.setdefault("positions", [])
-        state.setdefault("trades_today", [])
+        state["positions"] = []
+        state["trades_today"] = []
+        state["trading_halted"] = False
         save_state(state)
     else:
         log.info(f"Startup: using existing baseline ${state['session_baseline']:.2f} for {today}")
+        # Restore halted state — if the loss limit was hit before a restart, don't resume trading
+        if state.get("trading_halted"):
+            trading_active = False
+            log.info("Startup: trading was halted (loss limit hit earlier today) — not resuming.")
+
+    # Catchup: if we start/restart during the trading window (after 09:33, before EOD)
+    # and hold no positions, run open_positions() immediately so a restart never
+    # causes us to sit out the whole day.
+    # Skip if trading was halted earlier today.
+    now_et = datetime.now(ET)
+    market_open_time = now_et.replace(hour=9, minute=33, second=0, microsecond=0)
+    entry_cutoff     = now_et.replace(hour=12, minute=0,  second=0, microsecond=0)
+    if trading_active and market_open_time <= now_et < entry_cutoff:
+        existing = [p for p in client.get_all_positions() if float(p.qty_available) > 0]
+        if not existing:
+            log.info("Startup catchup: market is open, no positions held — running open_positions() now.")
+            open_positions()
+        else:
+            log.info(f"Startup catchup: already holding {len(existing)} position(s), skipping entry.")
+
     while True:
         try:
             schedule.run_pending()
         except Exception as e:
             log.error(f"Scheduler error (continuing): {e}")
-        time.sleep(30)
+        time.sleep(5)  # 5s granularity so check_pnl fires every ~35s not ~60s
