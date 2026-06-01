@@ -46,8 +46,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             perf_path = os.path.join(BASE_DIR, "performance_log.json")
             history = []
             if os.path.exists(perf_path):
-                with open(perf_path) as f:
-                    history = json.load(f)
+                try:
+                    with open(perf_path) as f:
+                        history = json.load(f)
+                except Exception:
+                    history = []
             data = json.dumps(history).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

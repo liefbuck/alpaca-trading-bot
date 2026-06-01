@@ -42,5 +42,16 @@
     "best_trade": 0,
     "worst_trade": 0,
     "result": "LOSS"
+  },
+  {
+    "date": "2026-05-28",
+    "daily_pnl": 142.37,
+    "trades": 10,
+    "wins": 9,
+    "losses": 1,
+    "win_rate": 90.0,
+    "best_trade": 26.1,
+    "worst_trade": -27.14,
+    "result": "WIN"
   }
 ]

@@ -109,8 +109,10 @@ def is_market_open() -> bool:
     return clock.is_open
 
 
+SPY_DOWN_THRESHOLD = -0.3  # skip entries if SPY is down more than this %
+
 def spy_is_positive() -> bool:
-    """Return True if SPY is up on the day — don't buy momentum into a falling market."""
+    """Return True unless SPY is down more than SPY_DOWN_THRESHOLD on the day."""
     try:
         data = yf.Ticker("SPY").history(period="2d", interval="1d")
         if len(data) < 2:
@@ -118,8 +120,8 @@ def spy_is_positive() -> bool:
         prev  = float(data["Close"].iloc[-2])
         today = float(data["Close"].iloc[-1])
         change = (today - prev) / prev * 100
-        log.info(f"SPY day change: {change:+.2f}%")
-        return change >= 0
+        log.info(f"SPY day change: {change:+.2f}% (threshold {SPY_DOWN_THRESHOLD:+.1f}%)")
+        return change >= SPY_DOWN_THRESHOLD
     except Exception as e:
         log.warning(f"SPY check failed ({e}) — allowing entry")
         return True
@@ -154,6 +156,12 @@ def open_positions():
         log.info("Past noon — entry window closed for today.")
         return
 
+    # One entry cycle per day — once we've bought in, don't re-enter after closing out.
+    state = load_state()
+    if state.get("entries_done"):
+        log.info("Entry cycle already complete for today — skipping re-entry.")
+        return
+
     pnl = get_daily_pnl()
     if pnl >= DAILY_TARGET:
         log.info(f"Target already hit (${pnl:.2f}). Skipping new entries.")
@@ -166,7 +174,7 @@ def open_positions():
 
     # Market direction filter: skip momentum buys on down-market days
     if not spy_is_positive():
-        log.info("SPY is negative on the day — skipping momentum entry.")
+        log.info(f"SPY down more than {SPY_DOWN_THRESHOLD:+.1f}% — skipping momentum entry.")
         return
 
     # Check if we already have open positions — don't stack
@@ -200,10 +208,13 @@ def open_positions():
         except Exception as e:
             log.error(f"Order failed {stock['symbol']}: {e}")
 
-    state = load_state()
-    state["date"] = str(datetime.now(ET).date())
-    state["positions"] = bought
-    save_state(state)
+    if bought:
+        state = load_state()
+        state["date"] = str(datetime.now(ET).date())
+        state["positions"] = bought
+        state["entries_done"] = True   # block any further entry cycles today
+        save_state(state)
+        log.info("Entry cycle marked complete — no further entries today.")
 
 
 def record_trade(symbol: str, pl: float):
@@ -269,6 +280,12 @@ def check_pnl():
     """Close each position individually when it hits its target or loss limit.
     Also close everything if the daily loss limit is breached."""
     global trading_active
+    # Sync in-memory flag from state — catches external halts (e.g. manual scripts).
+    if trading_active:
+        _state = load_state()
+        if _state.get("trading_halted"):
+            trading_active = False
+            log.info("check_pnl: trading_halted flag detected in state — halting.")
     if not trading_active:
         return
     if not is_market_open():
@@ -362,8 +379,8 @@ def eod_close():
     except Exception as e:
         log.error(f"EOD: failed to write performance log ({e}) — continuing shutdown.")
     global trading_active
+    persist_halted(False)  # Reset for next day — write before flipping memory flag
     trading_active = False
-    persist_halted(False)  # Reset for next day
 
 
 def daily_reset():
@@ -385,6 +402,7 @@ def daily_reset():
     state["positions"] = []
     state["trades_today"] = []
     state["trading_halted"] = False
+    state["entries_done"] = False
     save_state(state)
     log.info("=" * 40)
     log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
@@ -404,7 +422,8 @@ def close_overnight():
     for pos in positions:
         pl = float(pos.unrealized_pl)
         log.info(f"  Closing overnight {pos.symbol}  P&L ${pl:+.2f}")
-        record_trade(pos.symbol, pl)   # record so overnight closes appear in performance log
+        # Do NOT record_trade here — these positions belonged to yesterday's session.
+        # EOD already logged them; recording again would pollute today's performance stats.
     close_all()
 
 
@@ -414,8 +433,8 @@ schedule.every().day.at("09:31").do(close_overnight)   # Close any overnight pos
 schedule.every(10).seconds.do(check_pnl)               # P&L check every 10 sec
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
-# Entry attempts every 15 min from 9:33 to 11:48 — stops after noon or once positions are open
-for _t in ["09:33", "09:48", "10:03", "10:18", "10:33", "10:48",
+# Entry attempts every 15 min from 9:32 to 11:47 — stops after noon or once positions are open
+for _t in ["09:32", "09:48", "10:03", "10:18", "10:33", "10:48",
            "11:03", "11:18", "11:33", "11:48"]:
     schedule.every().day.at(_t).do(open_positions)
 
@@ -455,6 +474,7 @@ if __name__ == "__main__":
         state["positions"] = []
         state["trades_today"] = []
         state["trading_halted"] = False
+        state["entries_done"] = False
         save_state(state)
     else:
         log.info(f"Startup: using existing baseline ${state['session_baseline']:.2f} for {today}")
@@ -468,7 +488,7 @@ if __name__ == "__main__":
     # causes us to sit out the whole day.
     # Skip if trading was halted earlier today.
     now_et = datetime.now(ET)
-    market_open_time = now_et.replace(hour=9, minute=33, second=0, microsecond=0)
+    market_open_time = now_et.replace(hour=9, minute=32, second=0, microsecond=0)
     entry_cutoff     = now_et.replace(hour=12, minute=0,  second=0, microsecond=0)
     if trading_active and market_open_time <= now_et < entry_cutoff:
         existing = [p for p in client.get_all_positions() if float(p.qty_available) > 0]
