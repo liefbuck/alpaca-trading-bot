@@ -178,9 +178,11 @@ def open_positions():
         log.info(f"SPY down more than {SPY_DOWN_THRESHOLD:+.1f}% — skipping momentum entry.")
         return
 
-    # Check if we already have open positions — don't stack
-    # Exclude positions with a pending close order (qty_available == 0)
-    existing = [p for p in client.get_all_positions() if float(p.qty_available) > 0]
+    # Check if we already have open positions — don't stack.
+    # Count ALL held positions: under bracket orders every position reserves
+    # its shares for the SL/TP legs (qty_available == 0), so this must not
+    # filter on qty_available or the guard would never fire.
+    existing = client.get_all_positions()
     if existing:
         log.info(f"Already holding {len(existing)} position(s), skipping entry.")
         return
@@ -564,7 +566,7 @@ if __name__ == "__main__":
     market_open_time = now_et.replace(hour=9, minute=32, second=0, microsecond=0)
     entry_cutoff     = now_et.replace(hour=10, minute=30, second=0, microsecond=0)
     if trading_active and market_open_time <= now_et < entry_cutoff:
-        existing = [p for p in client.get_all_positions() if float(p.qty_available) > 0]
+        existing = client.get_all_positions()
         if not existing:
             log.info("Startup catchup: market is open, no positions held — running open_positions() now.")
             open_positions()
