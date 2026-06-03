@@ -86,7 +86,7 @@ async function getLogs() {
 
 async function getConfig() {
   try { return await fetch("/config").then(r => r.json()); }
-  catch { return { daily_target: 200, daily_loss_limit: -300, per_position_stop: -150, per_position_target: 20, max_positions: 10, session_baseline: null }; }
+  catch { return { daily_target: 200, daily_loss_limit: -300, per_position_stop: -20, per_position_target: 20, max_positions: 5, session_baseline: null }; }
 }
 
 async function getPerformance() {

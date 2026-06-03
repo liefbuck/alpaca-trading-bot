@@ -3,6 +3,7 @@ import json
 import time
 import schedule
 from datetime import datetime
+from uuid import UUID
 import pytz
 import logging
 from dotenv import load_dotenv
@@ -330,7 +331,7 @@ def step_trailing_stops():
 
         new_stop_price = round(entry_price + new_stop_pl / qty, 2)
         try:
-            client.replace_order_by_id(sl_id, ReplaceOrderRequest(stop_price=new_stop_price))
+            client.replace_order_by_id(UUID(sl_id), ReplaceOrderRequest(stop_price=new_stop_price))
             log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share)")
             steps_reached[symbol] = new_stop_pl
             updated = True
