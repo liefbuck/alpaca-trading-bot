@@ -12,7 +12,7 @@ function Write-Log($msg) {
 Write-Log "Watchdog started"
 
 while ($true) {
-    foreach ($script in @("bot.py", "serve.py")) {
+    foreach ($script in @("bot.py", "serve.py", "step_watch.py")) {
         $running = Get-CimInstance Win32_Process -Filter "name='python.exe'" |
                    Where-Object { $_.ExecutablePath -eq $py -and $_.CommandLine -like "*$script*" }
         if (-not $running) {
