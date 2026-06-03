@@ -292,7 +292,11 @@ def step_trailing_stops():
 
         new_stop_price = round(entry_price + new_stop_pl / qty, 2)
         try:
-            client.replace_order_by_id(UUID(sl_id), ReplaceOrderRequest(stop_price=new_stop_price))
+            # replace_order cancels the existing order and returns a NEW order with a
+            # new ID. Capture it so the next step targets the live order, not the
+            # stale (now-replaced) one.
+            new_order = client.replace_order_by_id(UUID(sl_id), ReplaceOrderRequest(stop_price=new_stop_price))
+            sl_order_ids[symbol] = str(new_order.id)
             log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share)")
             steps_reached[symbol] = new_stop_pl
             updated = True
@@ -302,6 +306,7 @@ def step_trailing_stops():
     if updated:
         state = load_state()
         state["stop_steps_reached"] = steps_reached
+        state["sl_order_ids"] = sl_order_ids
         save_state(state)
 
 
