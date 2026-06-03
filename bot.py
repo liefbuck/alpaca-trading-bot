@@ -395,8 +395,9 @@ def log_daily_performance():
     state = load_state()
     trades = state.get("trades_today", [])
     daily_pnl = get_daily_pnl()
-    wins  = [t for t in trades if t["pl"] > 0]
-    losses = [t for t in trades if t["pl"] <= 0]
+    # Break-even ($0.00) counts as a win — treat it as +$0.01.
+    wins  = [t for t in trades if t["pl"] >= 0]
+    losses = [t for t in trades if t["pl"] < 0]
 
     entry = {
         "date":        str(datetime.now(ET).date()),
