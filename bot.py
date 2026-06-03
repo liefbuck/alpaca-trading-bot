@@ -467,8 +467,9 @@ def log_daily_performance():
 
 def eod_close():
     log.info("EOD: Force-closing all positions.")
-    # Record each open position's unrealized P&L before the bulk close
-    # so the performance log has accurate trade-level data.
+    # Catch any bracket orders that fired in the last few seconds before EOD.
+    sync_bracket_fills()
+    # Record each still-open position's unrealized P&L before the bulk close.
     try:
         for pos in client.get_all_positions():
             pl = float(pos.unrealized_pl)
