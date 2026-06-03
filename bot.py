@@ -10,10 +10,10 @@ from dotenv import load_dotenv
 import yfinance as yf
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
 from screener import get_top_momentum
-from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_POSITION_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_POSITION_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET, STOP_STEPS
 
 load_dotenv()
 
@@ -109,7 +109,7 @@ def is_market_open() -> bool:
     return clock.is_open
 
 
-SPY_DOWN_THRESHOLD = -0.3  # skip entries if SPY is down more than this %
+SPY_DOWN_THRESHOLD = 0.0  # skip entries if SPY is down at all on the day
 
 def spy_is_positive() -> bool:
     """Return True unless SPY is down more than SPY_DOWN_THRESHOLD on the day."""
@@ -151,9 +151,9 @@ def open_positions():
         return
 
     now_et = datetime.now(ET)
-    entry_cutoff = now_et.replace(hour=12, minute=0, second=0, microsecond=0)
+    entry_cutoff = now_et.replace(hour=10, minute=30, second=0, microsecond=0)
     if now_et >= entry_cutoff:
-        log.info("Past noon — entry window closed for today.")
+        log.info("Past 10:30 — entry window closed for today.")
         return
 
     # One entry cycle per day — once we've bought in, don't re-enter after closing out.
@@ -194,16 +194,32 @@ def open_positions():
     per_pos_buying_power = float(acct.buying_power) / MAX_POSITIONS
 
     bought = []
+    sl_order_ids = {}
+
     for stock in top:
         qty = position_size(stock["price"], per_pos_buying_power)
+        price = stock["price"]
+        take_profit_price = round(price + PER_POSITION_TARGET / qty, 2)
+        stop_price        = round(price + PER_POSITION_LOSS_LIMIT / qty, 2)
         try:
             order = client.submit_order(MarketOrderRequest(
                 symbol=stock["symbol"],
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                stop_loss=StopLossRequest(stop_price=stop_price),
             ))
-            log.info(f"BUY {qty}x {stock['symbol']} ~${stock['price']} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
+            # Capture the stop-loss leg ID so we can ratchet it later
+            sl_leg = next(
+                (leg for leg in (order.legs or [])
+                 if str(getattr(leg, "order_type", "")).lower() in ("stop", "stop_limit")),
+                None,
+            )
+            if sl_leg:
+                sl_order_ids[stock["symbol"]] = str(sl_leg.id)
+            log.info(f"BUY {qty}x {stock['symbol']} ~${price} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
             bought.append(stock["symbol"])
         except Exception as e:
             log.error(f"Order failed {stock['symbol']}: {e}")
@@ -212,7 +228,9 @@ def open_positions():
         state = load_state()
         state["date"] = str(datetime.now(ET).date())
         state["positions"] = bought
-        state["entries_done"] = True   # block any further entry cycles today
+        state["sl_order_ids"] = sl_order_ids
+        state["stop_steps_reached"] = {}   # symbol -> highest stop level locked in so far
+        state["entries_done"] = True
         save_state(state)
         log.info("Entry cycle marked complete — no further entries today.")
 
@@ -276,11 +294,103 @@ def close_all():
         log.error(f"Error closing all positions: {e}")
 
 
+def step_trailing_stops():
+    """Ratchet each position's stop-loss order up through the STOP_STEPS ladder."""
+    state = load_state()
+    sl_order_ids     = state.get("sl_order_ids", {})
+    steps_reached    = state.get("stop_steps_reached", {})
+    if not sl_order_ids:
+        return
+
+    updated = False
+    try:
+        positions = client.get_all_positions()
+    except Exception:
+        return
+
+    for pos in positions:
+        symbol      = pos.symbol
+        sl_id       = sl_order_ids.get(symbol)
+        if not sl_id:
+            continue
+        pl          = float(pos.unrealized_pl)
+        qty         = float(pos.qty)
+        entry_price = float(pos.avg_entry_price)
+        current_step = steps_reached.get(symbol, -1)  # highest stop_pl level already applied
+
+        # Find the highest step we've earned but not yet applied
+        new_stop_pl = None
+        for trigger, stop_pl in sorted(STOP_STEPS, reverse=True):
+            if pl >= trigger and stop_pl > current_step:
+                new_stop_pl = stop_pl
+                break
+
+        if new_stop_pl is None:
+            continue
+
+        new_stop_price = round(entry_price + new_stop_pl / qty, 2)
+        try:
+            client.replace_order_by_id(sl_id, ReplaceOrderRequest(stop_price=new_stop_price))
+            log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share)")
+            steps_reached[symbol] = new_stop_pl
+            updated = True
+        except Exception as e:
+            log.warning(f"step_trailing_stops: could not update {symbol} stop: {e}")
+
+    if updated:
+        state = load_state()
+        state["stop_steps_reached"] = steps_reached
+        save_state(state)
+
+
+def sync_bracket_fills():
+    """Detect positions closed by bracket orders and record their P&L."""
+    state = load_state()
+    tracked = set(state.get("positions", []))
+    if not tracked:
+        return
+    try:
+        open_syms = {p.symbol for p in client.get_all_positions()}
+    except Exception:
+        return
+    closed_syms = tracked - open_syms
+    if not closed_syms:
+        return
+
+    today = datetime.now(ET).date()
+    recorded = {t["symbol"] for t in state.get("trades_today", [])}
+
+    for symbol in closed_syms:
+        if symbol in recorded:
+            continue
+        try:
+            orders = client.get_orders(GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[symbol],
+                limit=10,
+            ))
+            buys  = [o for o in orders if o.side.value == "buy"  and o.filled_avg_price and o.submitted_at and o.submitted_at.astimezone(ET).date() == today]
+            sells = [o for o in orders if o.side.value == "sell" and o.filled_avg_price and o.submitted_at and o.submitted_at.astimezone(ET).date() == today]
+            if buys and sells:
+                entry_price = float(buys[0].filled_avg_price)
+                exit_price  = float(sells[0].filled_avg_price)
+                qty         = float(sells[0].filled_qty)
+                pl          = round((exit_price - entry_price) * qty, 2)
+                log.info(f"Bracket closed {symbol}: entry ${entry_price:.2f} → exit ${exit_price:.2f} | P&L ${pl:+.2f}")
+                record_trade(symbol, pl)
+        except Exception as e:
+            log.warning(f"sync_bracket_fills: could not record {symbol}: {e}")
+
+    # Remove closed symbols from tracked positions in state
+    state = load_state()
+    state["positions"] = list(open_syms & tracked)
+    save_state(state)
+
+
 def check_pnl():
-    """Close each position individually when it hits its target or loss limit.
-    Also close everything if the daily loss limit is breached."""
+    """Monitor positions and enforce the daily loss limit kill switch.
+    Per-position exits are handled by bracket orders submitted at entry."""
     global trading_active
-    # Sync in-memory flag from state — catches external halts (e.g. manual scripts).
     if trading_active:
         _state = load_state()
         if _state.get("trading_halted"):
@@ -291,29 +401,21 @@ def check_pnl():
     if not is_market_open():
         return
 
+    sync_bracket_fills()
+    step_trailing_stops()
+
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
 
-    positions = client.get_all_positions()
-    for pos in positions:
-        # Skip if a close order is already pending (shares held for orders)
-        if float(pos.qty_available) <= 0:
-            log.info(f"  {pos.symbol}  close order pending, skipping.")
-            continue
-        pl = float(pos.unrealized_pl)
-        symbol = pos.symbol
-        if pl >= PER_POSITION_TARGET:
-            log.info(f"TARGET HIT {symbol} +${pl:.2f} — closing.")
-            close_position(symbol, pl)
-        elif pl <= PER_POSITION_LOSS_LIMIT:
-            log.info(f"LOSS LIMIT {symbol} ${pl:.2f} — closing.")
-            close_position(symbol, pl)
-        else:
-            log.info(f"  {symbol}  P&L ${pl:+.2f}  (target ${PER_POSITION_TARGET:.0f} | limit ${PER_POSITION_LOSS_LIMIT:.0f})")
+    steps_reached = load_state().get("stop_steps_reached", {})
+    for pos in client.get_all_positions():
+        pl   = float(pos.unrealized_pl)
+        step = steps_reached.get(pos.symbol)
+        stop_note = f" [stop locked at ${step:+.0f}]" if step is not None else " [stop at initial]"
+        log.info(f"  {pos.symbol}  P&L ${pl:+.2f}{stop_note}")
 
-    # Kill switch: stop trading for the day if total daily loss is too deep
     if daily_pnl <= DAILY_LOSS_LIMIT:
-        log.info(f"DAILY LOSS LIMIT HIT ${daily_pnl:.2f} — halting for the day.")
+        log.info(f"DAILY LOSS LIMIT HIT ${daily_pnl:.2f} — cancelling brackets and halting.")
         close_all()
         trading_active = False
         persist_halted(True)
@@ -403,6 +505,8 @@ def daily_reset():
     state["trades_today"] = []
     state["trading_halted"] = False
     state["entries_done"] = False
+    state["sl_order_ids"] = {}
+    state["stop_steps_reached"] = {}
     save_state(state)
     log.info("=" * 40)
     log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
@@ -430,12 +534,11 @@ def close_overnight():
 # ── Schedule ─────────────────────────────────────────────────────────────────
 schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
 schedule.every().day.at("09:31").do(close_overnight)   # Close any overnight positions
-schedule.every(10).seconds.do(check_pnl)               # P&L check every 10 sec
+schedule.every(5).seconds.do(check_pnl)                # P&L check every 5 sec
 schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
 
-# Entry attempts every 15 min from 9:32 to 11:47 — stops after noon or once positions are open
-for _t in ["09:32", "09:48", "10:03", "10:18", "10:33", "10:48",
-           "11:03", "11:18", "11:33", "11:48"]:
+# Entry attempts every 15 min from 9:32 to 10:18 — stops after 10:30 or once positions are open
+for _t in ["09:32", "09:48", "10:03", "10:18"]:
     schedule.every().day.at(_t).do(open_positions)
 
 def wait_for_network(max_wait_seconds: int = 300, interval: int = 15):
@@ -475,6 +578,8 @@ if __name__ == "__main__":
         state["trades_today"] = []
         state["trading_halted"] = False
         state["entries_done"] = False
+        state["sl_order_ids"] = {}
+        state["stop_steps_reached"] = {}
         save_state(state)
     else:
         log.info(f"Startup: using existing baseline ${state['session_baseline']:.2f} for {today}")
@@ -489,7 +594,7 @@ if __name__ == "__main__":
     # Skip if trading was halted earlier today.
     now_et = datetime.now(ET)
     market_open_time = now_et.replace(hour=9, minute=32, second=0, microsecond=0)
-    entry_cutoff     = now_et.replace(hour=12, minute=0,  second=0, microsecond=0)
+    entry_cutoff     = now_et.replace(hour=10, minute=30, second=0, microsecond=0)
     if trading_active and market_open_time <= now_et < entry_cutoff:
         existing = [p for p in client.get_all_positions() if float(p.qty_available) > 0]
         if not existing:
@@ -503,4 +608,4 @@ if __name__ == "__main__":
             schedule.run_pending()
         except Exception as e:
             log.error(f"Scheduler error (continuing): {e}")
-        time.sleep(5)  # 5s granularity so check_pnl fires every ~35s not ~60s
+        time.sleep(1)  # 1s granularity so check_pnl fires every ~5s
