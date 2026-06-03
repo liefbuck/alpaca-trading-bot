@@ -220,6 +220,8 @@ def open_positions():
             )
             if sl_leg:
                 sl_order_ids[stock["symbol"]] = str(sl_leg.id)
+            else:
+                log.warning(f"  {stock['symbol']}: bracket SL leg not returned — step stops disabled for this position")
             log.info(f"BUY {qty}x {stock['symbol']} ~${price} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
             bought.append(stock["symbol"])
         except Exception as e:
@@ -244,47 +246,6 @@ def record_trade(symbol: str, pl: float):
     state["trades_today"] = trades
     save_state(state)
 
-
-def close_position(symbol: str, pl: float = None):
-    try:
-        pos = client.get_open_position(symbol)
-        entry_price = float(pos.avg_entry_price)
-        qty = float(pos.qty)
-        submitted_at = datetime.now(ET)
-        client.close_position(symbol)
-        log.info(f"Closed position: {symbol}")
-        # Best-effort: check if fill is already available (no sleep — don't block scheduler).
-        # IMPORTANT: only accept sell orders submitted TODAY to avoid picking up stale
-        # historical fills which produce completely wrong P&L numbers.
-        try:
-            orders = client.get_orders(GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED,
-                symbols=[symbol],
-                limit=10,
-            ))
-            today = submitted_at.date()
-            sell = next(
-                (
-                    o for o in orders
-                    if o.side.value == "sell"
-                    and o.filled_avg_price
-                    and o.submitted_at is not None
-                    and o.submitted_at.astimezone(ET).date() == today
-                ),
-                None,
-            )
-            if sell:
-                actual_pl = (float(sell.filled_avg_price) - entry_price) * qty
-                logged = f"${pl:.2f}" if pl is not None else "n/a"
-                log.info(f"  {symbol} actual fill: ${float(sell.filled_avg_price):.4f} | realized P&L: ${actual_pl:.2f} (logged {logged})")
-                record_trade(symbol, actual_pl)
-            elif pl is not None:
-                record_trade(symbol, pl)
-        except Exception:
-            if pl is not None:
-                record_trade(symbol, pl)
-    except Exception as e:
-        log.error(f"Error closing {symbol}: {e}")
 
 
 def close_all():
