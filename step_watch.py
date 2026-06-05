@@ -28,6 +28,12 @@ WATCH = [
     ("Bracket closed",       "Position exited (bracket)"),
     ("DAILY LOSS LIMIT HIT", "DAILY LOSS LIMIT HIT"),
     ("Order failed",         "Order rejected"),
+    # Entry-window decisions — one ping per window (09:32/09:48/10:03/10:18),
+    # win or skip. "SPY day change" fires every window with the SPY reading;
+    # the other two only fire on the SPY-positive branch.
+    ("SPY day change",       "Entry window check"),
+    ("No qualifying momentum","Entry window: no setups"),
+    ("BUY ",                 "ENTRY FILLED"),
 ]
 
 POLL_SECONDS = 2
