@@ -443,6 +443,20 @@ def log_daily_performance():
 
 
 def eod_close():
+    global trading_active
+    # This fires every calendar day, but the market is only open on trading days.
+    # At 15:45 ET a normal session is still open (closes 16:00), so is_open
+    # cleanly identifies trading days. On weekends/holidays, skip the whole EOD
+    # routine so we don't append an empty entry to performance_log.json.
+    try:
+        if not client.get_clock().is_open:
+            log.info("EOD: non-trading day (weekend/holiday) — skipping summary.")
+            persist_halted(False)
+            trading_active = False
+            return
+    except Exception as e:
+        log.warning(f"EOD: clock check failed ({e}) — proceeding with close.")
+
     log.info("EOD: Force-closing all positions.")
     # Catch any bracket orders that fired in the last few seconds before EOD.
     sync_bracket_fills()
@@ -459,7 +473,6 @@ def eod_close():
         log_daily_performance()
     except Exception as e:
         log.error(f"EOD: failed to write performance log ({e}) — continuing shutdown.")
-    global trading_active
     persist_halted(False)  # Reset for next day — write before flipping memory flag
     trading_active = False
 
