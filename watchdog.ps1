@@ -42,30 +42,36 @@ function Find-RunningPid($script) {
 Write-Log "Watchdog started (hardened/pid-file)"
 
 while ($true) {
-    foreach ($script in $scripts) {
-        $pidFile = Get-PidFile $script
-        $procId  = $null
-        if (Test-Path $pidFile) {
-            $procId = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    # Guard the whole sweep: a transient failure (CIM hiccup, Start-Process throw)
+    # must never crash the watchdog itself -- nothing would restart the restarter.
+    try {
+        foreach ($script in $scripts) {
+            $pidFile = Get-PidFile $script
+            $procId  = $null
+            if (Test-Path $pidFile) {
+                $procId = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+            }
+
+            if (Test-Alive $procId) { continue }   # tracked process alive -> nothing to do
+
+            # Tracked PID dead/unknown. Try to adopt an existing instance before
+            # relaunching, with one retry, so a transient null read can't duplicate.
+            $found = Find-RunningPid $script
+            if (-not $found) { Start-Sleep -Seconds 2; $found = Find-RunningPid $script }
+
+            if ($found) {
+                Set-Content -Path $pidFile -Value $found
+                Write-Log "ADOPT: $script already running (PID $found) - tracking"
+                continue
+            }
+
+            # Genuinely absent after retries -> relaunch and record the new PID.
+            $proc = Start-Process $py -ArgumentList $script -WorkingDirectory $baseDir -WindowStyle Normal -PassThru
+            Set-Content -Path $pidFile -Value $proc.Id
+            Write-Log "RESTART: $script not running - relaunched (PID $($proc.Id))"
         }
-
-        if (Test-Alive $procId) { continue }   # tracked process alive -> nothing to do
-
-        # Tracked PID dead/unknown. Try to adopt an existing instance before
-        # relaunching, with one retry, so a transient null read can't duplicate.
-        $found = Find-RunningPid $script
-        if (-not $found) { Start-Sleep -Seconds 2; $found = Find-RunningPid $script }
-
-        if ($found) {
-            Set-Content -Path $pidFile -Value $found
-            Write-Log "ADOPT: $script already running (PID $found) - tracking"
-            continue
-        }
-
-        # Genuinely absent after retries -> relaunch and record the new PID.
-        $proc = Start-Process $py -ArgumentList $script -WorkingDirectory $baseDir -WindowStyle Normal -PassThru
-        Set-Content -Path $pidFile -Value $proc.Id
-        Write-Log "RESTART: $script not running - relaunched (PID $($proc.Id))"
+    } catch {
+        Write-Log "WATCHDOG ERROR (continuing): $($_.Exception.Message)"
     }
     Start-Sleep -Seconds 60
 }

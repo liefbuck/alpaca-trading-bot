@@ -128,6 +128,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
 if __name__ == "__main__":
-    server = http.server.ThreadingHTTPServer(("", PORT), Handler)
+    # Bind to loopback only. Binding to "" (0.0.0.0) exposed the dashboard AND the
+    # authenticated /proxy endpoint (which injects Alpaca keys) to the whole LAN.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Dashboard running at http://localhost:{PORT}")
     server.serve_forever()

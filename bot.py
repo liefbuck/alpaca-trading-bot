@@ -41,7 +41,8 @@ client = TradingClient(
 )
 
 trading_active = True
-_last_api_error_log: float = 0.0   # epoch seconds — rate-limits repeated DNS error logs
+_last_api_error_log: float = 0.0       # epoch seconds — rate-limits repeated DNS error logs
+_last_market_closed_log: float = 0.0   # epoch seconds — rate-limits "market closed" log to 1/hr
 
 
 def save_state(data: dict):
@@ -94,7 +95,7 @@ def get_account():
 
 
 def is_market_open() -> bool:
-    global _last_api_error_log
+    global _last_api_error_log, _last_market_closed_log
     try:
         clock = client.get_clock()
     except Exception as e:
@@ -104,9 +105,11 @@ def is_market_open() -> bool:
             _last_api_error_log = now_ts
         return False  # treat as market closed so nothing dangerous runs
     if not clock.is_open:
-        now = datetime.now(ET)
-        if now.minute == 0:
+        now_ts = time.time()
+        if now_ts - _last_market_closed_log > 3600:  # log at most once an hour, not every 5s
+            now = datetime.now(ET)
             log.info(f"Market closed ({now.strftime('%A %H:%M ET')}). Next open: {clock.next_open}")
+            _last_market_closed_log = now_ts
     return clock.is_open
 
 
@@ -202,8 +205,13 @@ def open_positions():
     for stock in top:
         qty = position_size(stock["price"], per_pos_buying_power)
         price = stock["price"]
-        take_profit_price = round(price + PER_POSITION_TARGET / qty, 2)
-        stop_price        = round(price + PER_POSITION_LOSS_LIMIT / qty, 2)
+        # Enforce at least a 1-cent gap so the bracket legs never round to the
+        # base price (Alpaca rejects TP<=base or SL>=base). Matters only for very
+        # low-priced / high-qty fills; harmless otherwise.
+        tp_offset = max(0.01, round(PER_POSITION_TARGET / qty, 2))
+        sl_offset = max(0.01, round(-PER_POSITION_LOSS_LIMIT / qty, 2))  # positive distance below
+        take_profit_price = round(price + tp_offset, 2)
+        stop_price        = round(price - sl_offset, 2)
         try:
             order = client.submit_order(MarketOrderRequest(
                 symbol=stock["symbol"],
@@ -408,7 +416,7 @@ def log_daily_performance():
         "win_rate":    round(len(wins) / len(trades) * 100, 1) if trades else 0,
         "best_trade":  round(max((t["pl"] for t in trades), default=0), 2),
         "worst_trade": round(min((t["pl"] for t in trades), default=0), 2),
-        "result":      "WIN" if daily_pnl > 0 else "LOSS",
+        "result":      "WIN" if daily_pnl >= 0 else "LOSS",  # break-even counts as a win
     }
 
     log.info(f"EOD Summary: {entry}")
@@ -503,14 +511,18 @@ def close_overnight():
 
 
 # ── Schedule ─────────────────────────────────────────────────────────────────
-schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
-schedule.every().day.at("09:31").do(close_overnight)   # Close any overnight positions
-schedule.every(5).seconds.do(check_pnl)                # P&L check every 5 sec
-schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
+# All daily times are pinned to US Eastern explicitly. Without the tz argument
+# `schedule` fires against the machine's LOCAL clock, so every entry/reset/close
+# would silently misfire if this host's timezone ever differed from ET.
+TZ = "America/New_York"
+schedule.every().day.at("09:29", TZ).do(daily_reset)       # Reset at market pre-open
+schedule.every().day.at("09:31", TZ).do(close_overnight)   # Close any overnight positions
+schedule.every(5).seconds.do(check_pnl)                    # P&L check every 5 sec
+schedule.every().day.at("15:45", TZ).do(eod_close)         # Force-close before EOD
 
 # Entry attempts every 15 min from 9:32 to 10:18 — stops after 10:30 or once positions are open
 for _t in ["09:32", "09:48", "10:03", "10:18"]:
-    schedule.every().day.at(_t).do(open_positions)
+    schedule.every().day.at(_t, TZ).do(open_positions)
 
 def wait_for_network(max_wait_seconds: int = 300, interval: int = 15):
     """Block until Alpaca API is reachable. Handles slow network on morning boot."""

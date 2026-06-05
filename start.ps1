@@ -10,9 +10,12 @@ Get-CimInstance Win32_Process |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 1
 
-# Kill any running bot/dashboard processes.
+# Kill only THIS bot's python processes (match the script name on the command
+# line). The old version killed every python.exe on the machine, taking out any
+# unrelated Python the user happened to be running.
 Write-Host "Stopping any running bots..."
 Get-CimInstance Win32_Process -Filter "name='python.exe'" |
+    Where-Object { $_.CommandLine -match 'bot\.py|serve\.py|step_watch\.py' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
 
