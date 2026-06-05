@@ -15,7 +15,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
 from screener import get_top_momentum
-from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_POSITION_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET, STOP_STEPS
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
 from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
 
 load_dotenv()
