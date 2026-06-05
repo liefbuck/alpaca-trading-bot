@@ -4,10 +4,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from screener import get_top_momentum
-from config import (
-    DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET,
-    PER_POSITION_STOP,
-)
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
+from trading_math import position_size, compute_bracket_prices
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -39,16 +37,10 @@ buying_power = float(acct.buying_power)
 
 print("\n=== PLACING ORDERS ===")
 for stock in picks:
-    price             = stock["price"]
-    shares_for_target = int(PER_POSITION_TARGET / (price * 0.01))
-    max_affordable    = int((buying_power / MAX_POSITIONS) / price)
-    qty = max(1, min(shares_for_target, max_affordable))
-    # Same protective bracket the bot uses, with a 1-cent minimum leg distance so
-    # the TP/SL never round to the base price (which Alpaca rejects).
-    tp_offset = max(0.01, round(PER_POSITION_TARGET / qty, 2))
-    sl_offset = max(0.01, round(-PER_POSITION_STOP / qty, 2))
-    take_profit_price = round(price + tp_offset, 2)
-    stop_price        = round(price - sl_offset, 2)
+    price = stock["price"]
+    qty = position_size(price, buying_power / MAX_POSITIONS)
+    # Same protective bracket the bot uses (shared helper, 1-cent min leg gap).
+    take_profit_price, stop_price = compute_bracket_prices(price, qty)
     try:
         order = client.submit_order(MarketOrderRequest(
             symbol=stock["symbol"],

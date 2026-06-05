@@ -1,8 +1,5 @@
 @echo off
-echo Starting MOMENTUM BOT only...
-echo Strategy: top 10 gap-up movers from S&P 500 + Nasdaq 100 at 9:33 AM
-echo.
-start "Momentum Bot" python bot.py
-start "Dashboard" python serve.py
-timeout /t 2 /nobreak >nul
-start http://localhost:5000/dashboard.html
+REM Delegates to start.ps1 (single source of truth) so the bot always comes up
+REM supervised by the watchdog with step_watch running. The old version started
+REM bot + dashboard only, leaving the bot unsupervised with no entry-window pings.
+powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0start.ps1"

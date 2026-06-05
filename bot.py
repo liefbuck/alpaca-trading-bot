@@ -6,6 +6,7 @@ from datetime import datetime
 from uuid import UUID
 import pytz
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 import yfinance as yf
@@ -15,6 +16,7 @@ from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, TakePr
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_POSITION_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_TARGET, STOP_STEPS
+from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
 
 load_dotenv()
 
@@ -24,7 +26,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(BASE_DIR, "bot.log")),
+        # Rotate so bot.log can't grow without bound (it was 3.3 MB and climbing).
+        # 5 MB x 3 backups = ~20 MB ceiling.
+        RotatingFileHandler(
+            os.path.join(BASE_DIR, "bot.log"),
+            maxBytes=5_000_000, backupCount=3,
+        ),
         logging.StreamHandler(),
     ],
 )
@@ -138,13 +145,6 @@ def scan_momentum() -> list:
     return top[:MAX_POSITIONS]
 
 
-def position_size(price: float, buying_power: float) -> int:
-    """Calculate share quantity. buying_power should be per-position buying power."""
-    shares_for_target = int(PER_POSITION_TARGET / (price * 0.01))
-    max_affordable = int(buying_power / price)
-    return max(1, min(shares_for_target, max_affordable))
-
-
 def open_positions():
     global trading_active
     if not trading_active:
@@ -205,13 +205,7 @@ def open_positions():
     for stock in top:
         qty = position_size(stock["price"], per_pos_buying_power)
         price = stock["price"]
-        # Enforce at least a 1-cent gap so the bracket legs never round to the
-        # base price (Alpaca rejects TP<=base or SL>=base). Matters only for very
-        # low-priced / high-qty fills; harmless otherwise.
-        tp_offset = max(0.01, round(PER_POSITION_TARGET / qty, 2))
-        sl_offset = max(0.01, round(-PER_POSITION_LOSS_LIMIT / qty, 2))  # positive distance below
-        take_profit_price = round(price + tp_offset, 2)
-        stop_price        = round(price - sl_offset, 2)
+        take_profit_price, stop_price = compute_bracket_prices(price, qty)
         try:
             order = client.submit_order(MarketOrderRequest(
                 symbol=stock["symbol"],
@@ -291,12 +285,7 @@ def step_trailing_stops():
         current_step = steps_reached.get(symbol, -1)  # highest stop_pl level already applied
 
         # Find the highest step we've earned but not yet applied
-        new_stop_pl = None
-        for trigger, stop_pl in sorted(STOP_STEPS, reverse=True):
-            if pl >= trigger and stop_pl > current_step:
-                new_stop_pl = stop_pl
-                break
-
+        new_stop_pl = select_stop_pl(pl, current_step)
         if new_stop_pl is None:
             continue
 
@@ -403,20 +392,10 @@ def log_daily_performance():
     state = load_state()
     trades = state.get("trades_today", [])
     daily_pnl = get_daily_pnl()
-    # Break-even ($0.00) counts as a win — treat it as +$0.01.
-    wins  = [t for t in trades if t["pl"] >= 0]
-    losses = [t for t in trades if t["pl"] < 0]
-
     entry = {
-        "date":        str(datetime.now(ET).date()),
-        "daily_pnl":   round(daily_pnl, 2),
-        "trades":      len(trades),
-        "wins":        len(wins),
-        "losses":      len(losses),
-        "win_rate":    round(len(wins) / len(trades) * 100, 1) if trades else 0,
-        "best_trade":  round(max((t["pl"] for t in trades), default=0), 2),
-        "worst_trade": round(min((t["pl"] for t in trades), default=0), 2),
-        "result":      "WIN" if daily_pnl >= 0 else "LOSS",  # break-even counts as a win
+        "date":      str(datetime.now(ET).date()),
+        "daily_pnl": round(daily_pnl, 2),
+        **classify_trades(trades, daily_pnl),
     }
 
     log.info(f"EOD Summary: {entry}")
@@ -567,6 +546,18 @@ if __name__ == "__main__":
     today = str(datetime.now(ET).date())
     if state.get("date") != today or not state.get("session_baseline"):
         log.info("Startup: no baseline for today — resetting session.")
+        # Safety: if the bot was down across a prior EOD, the broker may still
+        # hold yesterday's positions with no stop tracking in state. On a genuine
+        # new-day startup, close any such leftovers before we begin so they
+        # aren't carried untracked/unmanaged through the session.
+        try:
+            stale = client.get_all_positions()
+            if stale:
+                log.warning(f"Startup: closing {len(stale)} stale position(s) from a prior day: "
+                            f"{[p.symbol for p in stale]}")
+                close_all()
+        except Exception as e:
+            log.error(f"Startup: could not check/close stale positions ({e})")
         reset_session()
         state = load_state()
         state["date"] = today
