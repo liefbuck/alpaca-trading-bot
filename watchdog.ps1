@@ -41,7 +41,33 @@ function Find-RunningPid($script) {
     return $null
 }
 
-Write-Log "Watchdog started (hardened/pid-file)"
+# Singleton guard: never let two watchdogs manage the bots at once (e.g. a
+# SYSTEM at-startup instance plus a per-user logon instance after an unattended
+# reboot). The first to start owns a lock file; a later instance that finds a
+# LIVE watchdog already recorded there exits immediately. Without this, two
+# watchdogs could race on the pid files and double-spawn.
+$lockFile = Join-Path $baseDir ".watchdog.lock"
+function Test-WatchdogAlive($procId) {
+    if (-not $procId) { return $false }
+    try { $p = Get-Process -Id $procId -ErrorAction Stop } catch { return $false }
+    return ($p.ProcessName -match 'powershell|pwsh')
+}
+if (Test-Path $lockFile) {
+    $otherPid = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($otherPid -and ("$otherPid" -ne "$PID") -and (Test-WatchdogAlive $otherPid)) {
+        Write-Log "Another watchdog (PID $otherPid) already running - instance $PID exiting."
+        return
+    }
+}
+Set-Content -Path $lockFile -Value $PID
+Start-Sleep -Milliseconds 300   # settle a near-simultaneous start race
+$owner = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+if ("$owner" -ne "$PID") {
+    Write-Log "Lost watchdog lock race to PID $owner - instance $PID exiting."
+    return
+}
+
+Write-Log "Watchdog started (hardened/pid-file/singleton)"
 
 while ($true) {
     # Guard the whole sweep: a transient failure (CIM hiccup, Start-Process throw)
