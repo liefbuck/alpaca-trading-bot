@@ -43,3 +43,52 @@
 2026-06-01 06:39:16  Watchdog started
 2026-06-01 06:39:17  RESTART: bot.py not running - relaunching
 2026-06-01 06:39:18  RESTART: serve.py not running - relaunching
+2026-06-02 06:42:00  Watchdog started
+2026-06-02 06:42:01  RESTART: bot.py not running - relaunching
+2026-06-02 06:42:01  RESTART: serve.py not running - relaunching
+2026-06-03 06:31:58  Watchdog started
+2026-06-03 06:31:59  RESTART: bot.py not running - relaunching
+2026-06-03 06:32:00  RESTART: serve.py not running - relaunching
+2026-06-03 10:50:14  RESTART: bot.py not running - relaunching
+2026-06-03 10:53:15  RESTART: bot.py not running - relaunching
+2026-06-03 10:57:17  RESTART: bot.py not running - relaunching
+2026-06-03 11:04:21  RESTART: bot.py not running - relaunching
+2026-06-03 11:07:22  RESTART: bot.py not running - relaunching
+2026-06-03 11:13:24  RESTART: bot.py not running - relaunching
+2026-06-03 11:17:29  RESTART: bot.py not running - relaunching
+2026-06-03 11:21:31  RESTART: bot.py not running - relaunching
+2026-06-03 12:38:51  RESTART: bot.py not running - relaunching
+2026-06-03 12:41:52  RESTART: bot.py not running - relaunching
+2026-06-03 12:47:54  RESTART: bot.py not running - relaunching
+2026-06-04 06:51:29  Watchdog started
+2026-06-04 06:51:30  RESTART: bot.py not running - relaunching
+2026-06-04 06:51:30  RESTART: serve.py not running - relaunching
+2026-06-04 06:51:30  RESTART: step_watch.py not running - relaunching
+2026-06-05 06:52:51  Watchdog started
+2026-06-05 06:52:52  RESTART: bot.py not running - relaunching
+2026-06-05 06:52:52  RESTART: serve.py not running - relaunching
+2026-06-05 06:52:52  RESTART: step_watch.py not running - relaunching
+2026-06-05 11:50:01  RESTART: step_watch.py not running - relaunching
+2026-06-05 13:57:26  Watchdog started (hardened/pid-file)
+2026-06-05 14:11:08  Watchdog started (hardened/pid-file)
+2026-06-05 14:11:12  RESTART: bot.py not running - relaunched (PID 7328)
+2026-06-05 14:11:14  RESTART: serve.py not running - relaunched (PID 5980)
+2026-06-05 14:26:20  RESTART: bot.py not running - relaunched (PID 19012)
+2026-06-05 14:37:26  RESTART: bot.py not running - relaunched (PID 13516)
+2026-06-05 14:42:28  RESTART: bot.py not running - relaunched (PID 9200)
+2026-06-06 00:43:59  Watchdog started (hardened/pid-file)
+2026-06-06 00:44:02  RESTART: bot.py not running - relaunched (PID 25048)
+2026-06-06 00:44:04  RESTART: serve.py not running - relaunched (PID 18020)
+2026-06-06 00:44:07  RESTART: step_watch.py not running - relaunched (PID 26036)
+2026-06-06 10:15:08  Watchdog started (hardened/pid-file)
+2026-06-06 10:15:12  RESTART: bot.py not running - relaunched (PID 11736)
+2026-06-06 10:15:14  RESTART: serve.py not running - relaunched (PID 13132)
+2026-06-06 10:15:17  RESTART: step_watch.py not running - relaunched (PID 19796)
+2026-06-07 10:28:01  Watchdog started (hardened/pid-file)
+2026-06-07 10:28:05  RESTART: bot.py not running - relaunched (PID 21632)
+2026-06-07 10:28:07  RESTART: serve.py not running - relaunched (PID 12588)
+2026-06-07 10:28:10  RESTART: step_watch.py not running - relaunched (PID 23968)
+2026-06-08 06:37:08  Watchdog started (hardened/pid-file)
+2026-06-08 06:37:15  RESTART: bot.py not running - relaunched (PID 24300)
+2026-06-08 06:37:17  RESTART: serve.py not running - relaunched (PID 21396)
+2026-06-08 06:37:20  RESTART: step_watch.py not running - relaunched (PID 25228)
