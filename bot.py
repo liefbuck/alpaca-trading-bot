@@ -345,8 +345,9 @@ def close_all():
         log.error(f"Error closing all positions: {e}")
 
 
-def step_trailing_stops():
-    """Ratchet each position's stop-loss order up through the STOP_STEPS ladder."""
+def step_trailing_stops(positions=None):
+    """Ratchet each position's stop-loss order up through the STOP_STEPS ladder.
+    `positions` may be supplied by the caller (check_pnl) to avoid re-fetching."""
     state = load_state()
     sl_order_ids     = state.get("sl_order_ids", {})
     steps_reached    = state.get("stop_steps_reached", {})
@@ -354,10 +355,11 @@ def step_trailing_stops():
         return
 
     updated = False
-    try:
-        positions = client.get_all_positions()
-    except Exception:
-        return
+    if positions is None:
+        try:
+            positions = client.get_all_positions()
+        except Exception:
+            return
 
     for pos in positions:
         symbol      = pos.symbol
@@ -394,16 +396,19 @@ def step_trailing_stops():
         save_state(state)
 
 
-def sync_bracket_fills():
-    """Detect positions closed by bracket orders and record their P&L."""
+def sync_bracket_fills(positions=None):
+    """Detect positions closed by bracket orders and record their P&L.
+    `positions` may be supplied by the caller (check_pnl) to avoid re-fetching."""
     state = load_state()
     tracked = set(state.get("positions", []))
     if not tracked:
         return
-    try:
-        open_syms = {p.symbol for p in client.get_all_positions()}
-    except Exception:
-        return
+    if positions is None:
+        try:
+            positions = client.get_all_positions()
+        except Exception:
+            return
+    open_syms = {p.symbol for p in positions}
     closed_syms = tracked - open_syms
     if not closed_syms:
         return
@@ -452,22 +457,30 @@ def check_pnl():
     if not is_market_open():
         return
 
-    sync_bracket_fills()
-    step_trailing_stops()
+    # Fetch open positions ONCE and share the snapshot with the fill-sync and
+    # trailing-stop steps (they each used to re-fetch — 3 calls every 5s). On a
+    # fetch failure, skip those steps but STILL run the equity-based loss-limit
+    # check below — the kill switch must not depend on the positions call.
+    try:
+        positions = client.get_all_positions()
+    except Exception as e:
+        log.warning(f"check_pnl: position fetch failed ({e}) — stop/fill sync skipped this cycle.")
+        positions = None
+
+    if positions is not None:
+        sync_bracket_fills(positions)
+        step_trailing_stops(positions)
 
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
 
-    steps_reached = load_state().get("stop_steps_reached", {})
-    try:
-        for pos in client.get_all_positions():
+    if positions is not None:
+        steps_reached = load_state().get("stop_steps_reached", {})
+        for pos in positions:
             pl   = float(pos.unrealized_pl)
             step = steps_reached.get(pos.symbol)
             stop_note = f" [stop locked at ${step:+.0f}]" if step is not None else " [stop at initial]"
             log.info(f"  {pos.symbol}  P&L ${pl:+.2f}{stop_note}")
-    except Exception as e:
-        # A transient read failure here must not abort the loss-limit check below.
-        log.warning(f"check_pnl: position readout failed ({e}) — continuing to limit check.")
 
     if daily_pnl <= DAILY_LOSS_LIMIT:
         log.info(f"DAILY LOSS LIMIT HIT ${daily_pnl:.2f} — cancelling brackets and halting.")

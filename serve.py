@@ -13,11 +13,22 @@ from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP, MAX_POSITI
 PORT = 5000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def tail(path, n=25):
+def tail(path, n=25, _chunk=16384):
+    # Read only the last _chunk bytes instead of the whole file (bot.log can be
+    # several MB and the dashboard polls /logs every 5s). 16 KB easily covers the
+    # last n lines; if we didn't start at byte 0 the first line may be partial, so
+    # slicing the last n drops it.
     if not os.path.exists(path):
         return []
-    with open(path, errors="replace") as f:
-        lines = f.readlines()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _chunk))
+            data = f.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
     return [l.strip() for l in lines[-n:]]
 
 class Handler(http.server.SimpleHTTPRequestHandler):

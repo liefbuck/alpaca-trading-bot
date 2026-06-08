@@ -222,6 +222,65 @@ class TestDailyPnlBaseline(unittest.TestCase):
             self.assertEqual(round(bot.get_daily_pnl(), 2), 200.0)
 
 
+class TestCheckPnl(unittest.TestCase):
+    def test_fetches_positions_once(self):
+        # check_pnl must fetch get_all_positions ONCE and share it with the fill
+        # sync + trailing-stop steps (it used to fetch 3x every 5s).
+        import bot
+        state = {"positions": ["AAA"], "sl_order_ids": {"AAA": "id1"},
+                 "stop_steps_reached": {}, "trading_halted": False}
+        pos = mock.MagicMock(symbol="AAA", unrealized_pl="1.0", qty="10", avg_entry_price="100")
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "is_market_open", return_value=True), \
+             mock.patch.object(bot, "get_daily_pnl", return_value=0.0), \
+             mock.patch.object(bot, "load_state", return_value=state), \
+             mock.patch.object(bot, "save_state"), \
+             mock.patch.object(bot, "record_trade"):
+            c.get_all_positions.return_value = [pos]
+            c.get_orders.return_value = []
+            bot.trading_active = True
+            bot.check_pnl()
+            self.assertEqual(c.get_all_positions.call_count, 1)
+
+    def test_loss_limit_still_checked_when_position_fetch_fails(self):
+        # A position-fetch failure must NOT disable the kill switch (it's
+        # equity-based via get_daily_pnl, independent of get_all_positions).
+        import bot
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "is_market_open", return_value=True), \
+             mock.patch.object(bot, "get_daily_pnl", return_value=-500.0), \
+             mock.patch.object(bot, "load_state", return_value={"trading_halted": False}), \
+             mock.patch.object(bot, "close_all") as close_all, \
+             mock.patch.object(bot, "persist_halted"):
+            c.get_all_positions.side_effect = RuntimeError("network")
+            bot.trading_active = True
+            bot.check_pnl()
+            close_all.assert_called_once()   # kill switch fired despite no positions
+
+
+class TestServeTail(unittest.TestCase):
+    def test_returns_last_n_lines_without_reading_whole_file(self):
+        import serve
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.log")
+            with open(p, "w") as f:
+                for i in range(5000):
+                    f.write(f"line{i}\n")
+            out = serve.tail(p, n=25)
+        self.assertEqual(len(out), 25)
+        self.assertEqual(out[-1], "line4999")
+        self.assertEqual(out[0], "line4975")
+
+    def test_handles_small_and_missing_files(self):
+        import serve
+        self.assertEqual(serve.tail("/nonexistent/none.log"), [])
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.log")
+            with open(p, "w") as f:
+                f.write("only\nthree\nlines\n")
+            self.assertEqual(serve.tail(p, n=25), ["only", "three", "lines"])
+
+
 class TestDailyResetWeekendGuard(unittest.TestCase):
     def test_no_reset_on_non_trading_day(self):
         import bot
