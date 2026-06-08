@@ -470,6 +470,7 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn("try {", src)            # self-heal guard
         self.assertIn("Get-PidFile", src)      # pid-file tracking
         self.assertIn("Get-Process -Id", src)  # reliable liveness check
+        self.assertIn(".watchdog.lock", src)   # singleton guard (no two watchdogs)
 
     def test_watchdog_path_independent(self):
         # The watchdog must derive its dir from its own location, not a hardcoded
@@ -501,6 +502,18 @@ class TestSourceGuards(unittest.TestCase):
     def test_no_duplicate_position_size(self):
         # position_size must live only in trading_math now (single source of truth).
         self.assertNotIn("def position_size", self._read("bot.py"))
+
+    def test_ps1_files_are_pure_ascii(self):
+        # Windows PowerShell 5.1 reads a no-BOM .ps1 as Windows-1252, so a single
+        # non-ASCII char (e.g. an em-dash pasted into a string) silently corrupts
+        # parsing — the script dies at launch with NO log line. This actually
+        # happened to watchdog.ps1. Keep every .ps1 pure ASCII.
+        import glob
+        for path in glob.glob(os.path.join(ROOT, "*.ps1")):
+            with open(path, "rb") as fh:
+                data = fh.read()
+            bad = [(i, b) for i, b in enumerate(data) if b > 127]
+            self.assertEqual(bad, [], f"{os.path.basename(path)} has non-ASCII byte(s) at {bad[:3]}")
 
 
 if __name__ == "__main__":
