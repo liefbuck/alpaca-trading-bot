@@ -317,6 +317,11 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
         leg = mock.MagicMock(order_type="stop", id=f"sl-{symbol}")
         return mock.MagicMock(legs=[leg])
 
+    # Patch the batched quote fetch to an identity (fresh price == scan price) so
+    # the order-placement tests exercise backfill/cap logic without a data client.
+    def _identity_prices(self, syms, fallbacks):
+        return dict(fallbacks)
+
     def test_backfill_skips_rejected_order(self):
         # The morning-of bug: top pick's bracket is rejected. We must still fill
         # MAX_POSITIONS by falling through to the next-best (backfill) candidate.
@@ -329,7 +334,7 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
             return self._fake_order(req.symbol)
 
         with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_price", side_effect=lambda s, f: f):
+             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
             c.submit_order.side_effect = submit
             bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
 
@@ -341,7 +346,7 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
         import bot
         cands = self._candidates(MAX_POSITIONS * 2)
         with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_price", side_effect=lambda s, f: f):
+             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
             c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
             bought, _ = bot._place_bracket_orders(cands, 1_000_000)
         self.assertEqual(len(bought), MAX_POSITIONS)   # never overbuys past the cap
@@ -349,11 +354,21 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
     def test_all_rejected_returns_empty(self):
         import bot
         with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_price", side_effect=lambda s, f: f):
+             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
             c.submit_order.side_effect = RuntimeError("nope")
             bought, sl_ids = bot._place_bracket_orders(self._candidates(3), 1_000_000)
         self.assertEqual(bought, [])
         self.assertEqual(sl_ids, {})
+
+    def test_quotes_fetched_once_for_whole_batch(self):
+        # Note-1 fix: one quote round-trip for all candidates, not one per order.
+        import bot
+        cands = self._candidates(MAX_POSITIONS * 2)
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices) as fp:
+            c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
+            bot._place_bracket_orders(cands, 1_000_000)
+        self.assertEqual(fp.call_count, 1)
 
     def test_scan_returns_backfill_candidates(self):
         import bot
@@ -362,26 +377,38 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
             out = bot.scan_momentum()
         self.assertEqual(out, fake[:MAX_POSITIONS * 2])  # ranked spares kept for backfill
 
-    def test_fresh_price_prefers_ask(self):
+    def test_fresh_prices_prefers_ask(self):
         import bot
         q = mock.MagicMock(ask_price=50.0, bid_price=49.0)
         with mock.patch.object(bot, "data_client") as dc:
-            dc.get_stock_latest_quote.return_value = {"AAPL": q}
-            self.assertEqual(bot.fresh_price("AAPL", 999.0), 50.0)
+            dc.get_stock_latest_quote.return_value = {"AAA": q}
+            self.assertEqual(bot.fresh_prices(["AAA"], {"AAA": 999.0})["AAA"], 50.0)
 
-    def test_fresh_price_falls_back_to_bid(self):
+    def test_fresh_prices_falls_back_to_bid(self):
         import bot
         q = mock.MagicMock(ask_price=0, bid_price=49.0)
         with mock.patch.object(bot, "data_client") as dc:
-            dc.get_stock_latest_quote.return_value = {"AAPL": q}
-            self.assertEqual(bot.fresh_price("AAPL", 999.0), 49.0)
+            dc.get_stock_latest_quote.return_value = {"AAA": q}
+            self.assertEqual(bot.fresh_prices(["AAA"], {"AAA": 999.0})["AAA"], 49.0)
 
-    def test_fresh_price_falls_back_to_scan_on_error(self):
-        # A quote hiccup must never block the order — fall back to the scan price.
+    def test_fresh_prices_missing_symbol_uses_scan(self):
+        # A symbol absent from the quote response keeps its scan price.
+        import bot
+        q = mock.MagicMock(ask_price=50.0, bid_price=49.0)
+        with mock.patch.object(bot, "data_client") as dc:
+            dc.get_stock_latest_quote.return_value = {"AAA": q}  # BBB missing
+            out = bot.fresh_prices(["AAA", "BBB"], {"AAA": 999.0, "BBB": 123.0})
+        self.assertEqual(out["AAA"], 50.0)
+        self.assertEqual(out["BBB"], 123.0)
+
+    def test_fresh_prices_falls_back_to_scan_on_batch_error(self):
+        # Note-2 fix: a feed failure falls every symbol back to its scan price
+        # (never raises), and backfill absorbs any resulting rejection.
         import bot
         with mock.patch.object(bot, "data_client") as dc:
             dc.get_stock_latest_quote.side_effect = RuntimeError("data feed down")
-            self.assertEqual(bot.fresh_price("AAPL", 123.45), 123.45)
+            out = bot.fresh_prices(["AAA", "BBB"], {"AAA": 1.0, "BBB": 2.0})
+        self.assertEqual(out, {"AAA": 1.0, "BBB": 2.0})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -411,6 +438,15 @@ class TestSourceGuards(unittest.TestCase):
     def test_startps1_kill_is_scoped(self):
         src = self._read("start.ps1")
         self.assertIn("bot\\.py|serve\\.py|step_watch\\.py", src)
+
+    def test_startps1_delegates_launch_to_watchdog(self):
+        # start.ps1 must NOT launch bot/serve itself — doing so spawned duplicate
+        # processes under a different interpreter than the watchdog adopts. It
+        # must only start the watchdog, which owns all spawning.
+        src = self._read("start.ps1")
+        self.assertIn("watchdog.ps1", src)
+        self.assertNotIn('-ArgumentList "bot.py"', src)
+        self.assertNotIn('-ArgumentList "serve.py"', src)
 
     def test_bat_files_delegate(self):
         for b in ("start.bat", "start_momentum.bat"):
