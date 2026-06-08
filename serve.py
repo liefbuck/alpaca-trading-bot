@@ -115,11 +115,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(502, str(e))
             return
 
-        # Block sensitive files from static serving
+        # Block sensitive files from static serving. Beyond the named state/secret
+        # files, refuse any source/state/log file by extension so the dashboard
+        # can't be used to read the bot's code or data (defense in depth — the
+        # server is loopback-only, but the dashboard never needs these).
         BLOCKED_FILES = {".env", "bot_state.json", "bot.log", "mr_state.json",
                          "performance_log.json", "watchdog.log"}
+        BLOCKED_EXT = (".py", ".ps1", ".bat", ".log", ".json", ".env", ".lock", ".pid")
         bare_path = self.path.split("?")[0].lstrip("/")
-        if bare_path in BLOCKED_FILES or bare_path.startswith("."):
+        if (bare_path in BLOCKED_FILES or bare_path.startswith(".")
+                or bare_path.lower().endswith(BLOCKED_EXT)):
             self.send_error(403, "Forbidden")
             return
         super().do_GET()

@@ -482,6 +482,10 @@ class TestSourceGuards(unittest.TestCase):
         src = self._read("serve.py")
         for f in (".env", "bot_state.json", "performance_log.json"):
             self.assertIn(f, src)
+        # Source/state files must also be blocked by extension (no serving code).
+        self.assertIn("BLOCKED_EXT", src)
+        self.assertIn('".py"', src)
+        self.assertIn("endswith(BLOCKED_EXT)", src)
 
     def test_watchdog_hardened(self):
         src = self._read("watchdog.ps1")

@@ -49,8 +49,14 @@ function Find-RunningPid($script) {
 $lockFile = Join-Path $baseDir ".watchdog.lock"
 function Test-WatchdogAlive($procId) {
     if (-not $procId) { return $false }
-    try { $p = Get-Process -Id $procId -ErrorAction Stop } catch { return $false }
-    return ($p.ProcessName -match 'powershell|pwsh')
+    # Must be a process ACTUALLY running watchdog.ps1 -- not merely some powershell
+    # that happens to have reused the dead lock PID. A bare ProcessName check would
+    # false-positive on PID reuse and make this fresh watchdog wrongly exit,
+    # potentially leaving the bot unsupervised. Fail safe (toward running): if the
+    # command line can't be read, treat it as NOT a live watchdog.
+    try { $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop } catch { return $false }
+    if (-not $p) { return $false }
+    return ($p.Name -match 'powershell|pwsh') -and ($p.CommandLine -like '*watchdog.ps1*')
 }
 if (Test-Path $lockFile) {
     $otherPid = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
