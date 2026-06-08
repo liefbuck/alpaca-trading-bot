@@ -8,3 +8,6 @@ config.js
 step_alerts.log
 .watchdog_*.pid
 install_boot_task.log
+.claude/
+.watchdog.lock
+.watchdog_*.pid
