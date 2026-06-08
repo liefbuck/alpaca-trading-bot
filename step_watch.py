@@ -69,6 +69,16 @@ def record(line: str, title: str) -> None:
     notify(title, line[-200:])
 
 
+def _file_id(path):
+    """Identity of the file currently at `path` (changes when the log is rotated
+    out and a fresh one is created). None if it can't be stat'd."""
+    try:
+        s = os.stat(path)
+        return (s.st_ino, s.st_dev)
+    except OSError:
+        return None
+
+
 def main() -> None:
     # Wait for the log to exist, then seek to the end so we only see new lines.
     while not os.path.exists(LOG_FILE):
@@ -79,22 +89,21 @@ def main() -> None:
 
     f = open(LOG_FILE, "r", errors="replace")
     f.seek(0, os.SEEK_END)
-    inode_size = os.path.getsize(LOG_FILE)
+    cur_id = _file_id(LOG_FILE)
 
     while True:
         line = f.readline()
         if not line:
-            # Handle log truncation/rotation (file shrank): reopen from start.
-            try:
-                size = os.path.getsize(LOG_FILE)
-            except OSError:
-                size = inode_size
-            if size < inode_size:
+            # RotatingFileHandler renames bot.log -> bot.log.1 and creates a fresh
+            # bot.log. Detect that by the file's identity changing (robust even if
+            # the new file has already grown past the old size by the time we
+            # check) and reopen from the start so no alert line is skipped.
+            new_id = _file_id(LOG_FILE)
+            if new_id is not None and new_id != cur_id:
                 f.close()
                 f = open(LOG_FILE, "r", errors="replace")
-                inode_size = size
+                cur_id = new_id
                 continue
-            inode_size = size
             time.sleep(POLL_SECONDS)
             continue
 

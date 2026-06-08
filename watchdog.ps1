@@ -12,7 +12,9 @@
 # null-CommandLine read can never trigger a duplicate launch.
 
 $py      = "C:\Users\liefb\AppData\Local\Python\pythoncore-3.14-64\python.exe"
-$baseDir = "C:\Users\liefb\OneDrive\Documents\ClaudeTrading"
+# Derive the project dir from the script's own location so the watchdog works
+# wherever the repo lives, with no hardcoded (and sync-prone) absolute path.
+$baseDir = $PSScriptRoot
 $log     = "$baseDir\watchdog.log"
 $scripts = @("bot.py", "serve.py", "step_watch.py")
 
