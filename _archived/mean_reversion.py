@@ -1,10 +1,16 @@
 """
-Mean Reversion Bot
-Strategy: buy stocks that are oversold (RSI < 30) and trading below their
-20-day SMA. Waits for the morning volatility to settle then runs 11 AM - 1 PM ET.
-Targets and limits are read from config.py. Complements the momentum bot.
+Mean Reversion Bot  (MANUAL / standalone — NOT auto-started by the watchdog).
+
+Strategy: buy oversold stocks (RSI < 30 and >1% below their 20-day SMA) between
+11:00 and 13:00 ET. Each entry gets a protective BRACKET (server-side take-profit
+and stop-loss) so positions stay protected even if this process dies; an RSI
+recovery (>= 50) is an additional early exit. Targets/limits come from config.py.
+Complements the momentum bot.
+
+Run it by hand:  python _archived/mean_reversion.py   (or start_meanreversion.bat)
 """
 import os
+import sys
 import json
 import time
 import schedule
@@ -13,28 +19,44 @@ import yfinance as yf
 from datetime import datetime
 import pytz
 import logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
+# This file lives in _archived/ but imports the project's shared modules from the
+# repo root, so put the root on sys.path before importing them.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from screener import get_top_mean_reversion
-from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP as PER_STOP, MAX_POSITIONS, PER_POSITION_TARGET as PER_TARGET
+from trading_math import position_size, compute_bracket_prices
+from config import (
+    DAILY_TARGET, DAILY_LOSS_LIMIT,
+    PER_POSITION_STOP as PER_STOP, MAX_POSITIONS, PER_POSITION_TARGET as PER_TARGET,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv(os.path.join(BASE_DIR, ".env")) or load_dotenv(os.path.join(ROOT, ".env"))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(BASE_DIR, "mean_reversion.log")),
+        # Rotate so mean_reversion.log can't grow without bound.
+        RotatingFileHandler(
+            os.path.join(BASE_DIR, "mean_reversion.log"),
+            maxBytes=5_000_000, backupCount=3,
+        ),
         logging.StreamHandler(),
     ],
 )
 log = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
+TZ = "America/New_York"   # pin schedule jobs to ET, not the machine's local clock
 
 RSI_PERIOD    = 14
 RSI_OVERSOLD  = 30   # entry threshold
@@ -70,35 +92,53 @@ def is_market_open() -> bool:
     return clock.is_open
 
 
-# Shared with the momentum bot for session baseline / daily P&L tracking.
-SHARED_STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
-# Own state file tracking only positions this bot opened.
-MR_STATE_FILE = os.path.join(BASE_DIR, "mr_state.json")
+# The momentum bot OWNS bot_state.json. We only READ its session_baseline (never
+# write it — a non-atomic shared write there could corrupt the momentum bot's
+# state). Our own positions/baseline live in mr_state.json.
+SHARED_STATE_FILE = os.path.join(ROOT, "bot_state.json")
+MR_STATE_FILE     = os.path.join(BASE_DIR, "mr_state.json")
 
 
 def load_state() -> dict:
+    """Read-only view of the momentum bot's shared state (for session_baseline)."""
     if os.path.exists(SHARED_STATE_FILE):
-        with open(SHARED_STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SHARED_STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 
 def load_mr_state() -> dict:
     if os.path.exists(MR_STATE_FILE):
-        with open(MR_STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(MR_STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {"positions": []}
     return {"positions": []}
 
 
 def save_mr_state(data: dict):
-    with open(MR_STATE_FILE, "w") as f:
+    # Atomic write so a crash mid-write can't corrupt mr_state.json.
+    tmp = MR_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, MR_STATE_FILE)
 
 
 def get_daily_pnl() -> float:
     acct = client.get_account()
-    state = load_state()
-    baseline = state.get("session_baseline") or float(acct.last_equity)
+    # Prefer the momentum bot's shared baseline so dashboard P&L stays consistent;
+    # else our own baseline; else CURRENT equity (P&L 0 — never a false loss-limit
+    # trip). Never fall back to yesterday's close, which would read the overnight
+    # move as today's loss.
+    baseline = load_state().get("session_baseline")
+    if baseline is None:
+        baseline = load_mr_state().get("mr_baseline")
+    if baseline is None:
+        baseline = float(acct.equity)
     return float(acct.equity) - baseline
 
 
@@ -108,14 +148,6 @@ def scan_mean_reversion() -> list:
     for s in results[:5]:
         log.info(f"  SIGNAL {s['symbol']}  ${s['price']}  RSI={s['rsi']}  {s['pct_below']}% below SMA")
     return results[:MAX_POSITIONS]
-
-
-def position_size(price: float) -> int:
-    acct = client.get_account()
-    buying_power = float(acct.buying_power) / MAX_POSITIONS
-    shares_for_target = int(PER_TARGET / (price * 0.01))
-    max_affordable    = int(buying_power / price)
-    return max(1, min(shares_for_target, max_affordable))
 
 
 def open_positions():
@@ -139,7 +171,7 @@ def open_positions():
         log.info("All mean-reversion slots filled.")
         return
 
-    # Also avoid symbols already held by the momentum bot
+    # Avoid symbols already held (by us or the momentum bot)
     all_held = {p.symbol for p in client.get_all_positions()}
 
     log.info("Scanning for oversold mean-reversion setups...")
@@ -150,17 +182,27 @@ def open_positions():
         log.info("No qualifying oversold stocks found.")
         return
 
+    acct = client.get_account()
+    per_pos_bp = float(acct.buying_power) / MAX_POSITIONS
+
     for stock in signals:
-        qty = position_size(stock["price"])
+        price = stock["price"]
+        qty = position_size(price, per_pos_bp)   # shared sizing helper
+        tp_price, sl_price = compute_bracket_prices(price, qty)
         try:
+            # BRACKET: broker-side take-profit + stop-loss protect the position
+            # even if this process dies (the old version placed naked market buys).
             client.submit_order(MarketOrderRequest(
                 symbol=stock["symbol"],
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=tp_price),
+                stop_loss=StopLossRequest(stop_price=sl_price),
             ))
             log.info(
-                f"BUY {qty}x {stock['symbol']} @ ~${stock['price']} "
+                f"BUY {qty}x {stock['symbol']} @ ~${price} | TP ${tp_price} SL ${sl_price} "
                 f"| RSI={stock['rsi']} | {stock['pct_below']}% below SMA"
             )
             owned.add(stock["symbol"])
@@ -172,72 +214,65 @@ def open_positions():
 
 
 def check_exits():
-    """Close positions that hit their profit target, stop, or RSI has recovered."""
+    """Brackets own the target/stop (server-side). This handles the RSI-recovery
+    early exit, the account-wide daily kill switch, and pruning closed names."""
     global trading_active
     if not trading_active or not is_market_open():
         return
 
-    # Daily kill switch
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
     if daily_pnl <= DAILY_LOSS_LIMIT:
-        log.info(f"DAILY LOSS LIMIT ${daily_pnl:.2f} — closing mean-reversion positions.")
+        log.info(f"DAILY LOSS LIMIT ${daily_pnl:.2f} - closing mean-reversion positions.")
         mr_state = load_mr_state()
         for symbol in mr_state.get("positions", []):
             try:
                 client.close_position(symbol)
             except Exception as e:
                 log.error(f"Loss limit close error {symbol}: {e}")
-        save_mr_state({"positions": []})
+        save_mr_state({"positions": [], "mr_baseline": mr_state.get("mr_baseline")})
         trading_active = False
         return
 
     mr_state = load_mr_state()
     owned = set(mr_state.get("positions", []))
+    if not owned:
+        return
 
-    positions = [p for p in client.get_all_positions() if p.symbol in owned]
-    for pos in positions:
-        # Skip if a close order is already pending (shares held for orders)
+    open_syms = {p.symbol for p in client.get_all_positions()}
+    # Prune names the bracket already closed (target/stop hit)
+    for sym in list(owned):
+        if sym not in open_syms:
+            log.info(f"  {sym} closed by bracket (target/stop hit).")
+            owned.discard(sym)
+
+    for pos in [p for p in client.get_all_positions() if p.symbol in owned]:
         if float(pos.qty_available) <= 0:
-            log.info(f"  {pos.symbol}  close order pending, skipping.")
-            continue
-        pl     = float(pos.unrealized_pl)
+            continue  # a close order is already pending
         symbol = pos.symbol
-
-        # Check RSI recovery as an additional exit signal
-        rsi_recovered = False
         try:
             hist = yf.Ticker(symbol).history(period="30d", interval="1d")
             rsi  = calc_rsi(hist["Close"])
-            rsi_recovered = rsi >= RSI_EXIT
         except Exception as e:
             log.warning(f"RSI check failed for {symbol}: {e}")
-
-        closed = False
-        if pl >= PER_TARGET:
-            log.info(f"TARGET HIT {symbol} +${pl:.2f} — closing.")
-        elif pl <= PER_STOP:
-            log.info(f"STOP HIT {symbol} ${pl:.2f} — closing.")
-        elif rsi_recovered:
-            log.info(f"RSI RECOVERED {symbol} RSI>={RSI_EXIT}, P&L=${pl:.2f} — closing.")
-        else:
-            log.info(f"  {symbol}  P&L ${pl:+.2f}  (target +${PER_TARGET:.0f} | stop ${PER_STOP:.0f})")
-
-        if pl >= PER_TARGET or pl <= PER_STOP or rsi_recovered:
+            continue
+        if rsi >= RSI_EXIT:
+            log.info(f"RSI RECOVERED {symbol} RSI>={RSI_EXIT}, P&L=${float(pos.unrealized_pl):+.2f} - closing.")
             try:
-                client.close_position(symbol)
-                closed = True
+                client.close_position(symbol)   # also cancels the bracket OCO
+                owned.discard(symbol)
             except Exception as e:
                 log.error(f"Error closing {symbol}: {e}")
-
-        if closed:
-            owned.discard(symbol)
+        else:
+            log.info(f"  {symbol}  P&L ${float(pos.unrealized_pl):+.2f}  RSI={rsi:.0f}  "
+                     f"(bracket +${PER_TARGET:.0f}/${PER_STOP:.0f})")
 
     mr_state["positions"] = list(owned)
     save_mr_state(mr_state)
 
 
 def eod_close():
+    global trading_active
     log.info("EOD: Closing mean-reversion positions.")
     mr_state = load_mr_state()
     for symbol in mr_state.get("positions", []):
@@ -246,9 +281,7 @@ def eod_close():
             log.info(f"EOD closed {symbol}")
         except Exception as e:
             log.error(f"EOD close error {symbol}: {e}")
-    mr_state["positions"] = []
-    save_mr_state(mr_state)
-    global trading_active
+    save_mr_state({"positions": []})
     trading_active = False
 
 
@@ -260,32 +293,27 @@ def daily_reset():
     if clock.next_open.date() != now.date() and not clock.is_open:
         return
     trading_active = True
-    # Refresh session_baseline so daily P&L starts from today's open equity
+    # Store OUR OWN baseline in mr_state.json. Do NOT write the momentum bot's
+    # bot_state.json (a non-atomic shared write there could corrupt it).
     acct = client.get_account()
-    state = load_state()
-    state["session_baseline"] = float(acct.equity)
-    state["date"] = str(datetime.now(ET).date())
-    state["trades_today"] = []
-    with open(SHARED_STATE_FILE, "w") as f:
-        json.dump(state, f)
-    save_mr_state({"positions": []})
+    save_mr_state({"positions": [], "mr_baseline": float(acct.equity)})
     log.info("=" * 40)
-    log.info(f"New trading day — state reset. Market closes: {clock.next_close}")
+    log.info(f"New trading day - mean-reversion state reset. Market closes: {clock.next_close}")
     log.info("=" * 40)
 
 
-# ── Schedule ──────────────────────────────────────────────────────────────────
-schedule.every().day.at("09:29").do(daily_reset)       # Reset at market pre-open
-schedule.every().day.at("11:00").do(open_positions)    # First scan
-schedule.every().day.at("13:00").do(open_positions)    # Second scan if slots remain
-schedule.every(1).minutes.do(check_exits)               # P&L check every 1 min
-schedule.every().day.at("15:45").do(eod_close)         # Force-close before EOD
+# -- Schedule (all wall-clock times pinned to ET, not the machine's local tz) ----
+schedule.every().day.at("09:29", TZ).do(daily_reset)       # Reset at market pre-open
+schedule.every().day.at("11:00", TZ).do(open_positions)    # First scan
+schedule.every().day.at("13:00", TZ).do(open_positions)    # Second scan if slots remain
+schedule.every(1).minutes.do(check_exits)                  # exit/kill-switch check every 1 min
+schedule.every().day.at("15:45", TZ).do(eod_close)         # Force-close before EOD
 
 if __name__ == "__main__":
     log.info("=" * 60)
     log.info("Mean Reversion Bot started")
     log.info(f"Entry: RSI < {RSI_OVERSOLD} + price > {MIN_PCT_BELOW}% below {SMA_PERIOD}-day SMA")
-    log.info(f"Exit:  +${PER_TARGET:.0f} target | ${PER_STOP:.0f} stop | RSI >= {RSI_EXIT} recovery")
+    log.info(f"Exit:  bracket +${PER_TARGET:.0f}/${PER_STOP:.0f} | RSI >= {RSI_EXIT} recovery")
     log.info("=" * 60)
     while True:
         try:

@@ -521,14 +521,35 @@ class TestSourceGuards(unittest.TestCase):
         # position_size must live only in trading_math now (single source of truth).
         self.assertNotIn("def position_size", self._read("bot.py"))
 
+    def test_mean_reversion_hardened(self):
+        # The manual mean-reversion bot shares the account/state, so its bugs can
+        # spill into the momentum bot. Keep the fixes locked in.
+        src = self._read("_archived/mean_reversion.py")
+        # Schedule pinned to ET, not the machine's local clock.
+        self.assertIn('"09:29", TZ', src)
+        self.assertIn('"11:00", TZ', src)
+        self.assertNotIn('"11:00").do', src)
+        # Must NOT write the momentum bot's shared bot_state.json (corruption risk);
+        # mr_state writes must be atomic.
+        self.assertNotIn('SHARED_STATE_FILE, "w"', src)
+        self.assertIn("os.replace", src)
+        # Shared sizing helper + protective bracket on every entry.
+        self.assertIn("from trading_math import", src)
+        self.assertNotIn("def position_size", src)
+        self.assertIn("OrderClass.BRACKET", src)
+        # Safe baseline: never fall back to yesterday's close.
+        self.assertNotIn("last_equity", src)
+
     def test_shell_scripts_are_pure_ascii(self):
         # Windows PowerShell 5.1 / cmd.exe read a no-BOM script in the legacy
         # Windows-1252 codepage, so a single non-ASCII char (e.g. an em-dash
         # pasted into a string) silently corrupts parsing — the script dies at
         # launch with NO log line. This actually happened to watchdog.ps1. Keep
-        # every .ps1 and .bat pure ASCII.
+        # every .ps1 and .bat (including the archived launcher) pure ASCII.
         import glob
-        paths = glob.glob(os.path.join(ROOT, "*.ps1")) + glob.glob(os.path.join(ROOT, "*.bat"))
+        paths = (glob.glob(os.path.join(ROOT, "*.ps1")) + glob.glob(os.path.join(ROOT, "*.bat"))
+                 + glob.glob(os.path.join(ROOT, "_archived", "*.bat"))
+                 + glob.glob(os.path.join(ROOT, "_archived", "*.ps1")))
         for path in paths:
             with open(path, "rb") as fh:
                 data = fh.read()
