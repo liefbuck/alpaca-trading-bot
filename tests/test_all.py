@@ -517,6 +517,16 @@ class TestSourceGuards(unittest.TestCase):
     def test_bot_log_rotation(self):
         self.assertIn("RotatingFileHandler", self._read("bot.py"))
 
+    def test_requirements_are_pinned(self):
+        # Every dependency must be pinned (==) so a fresh install can't pull a
+        # breaking new major version. Unpinned deps are how "it worked yesterday"
+        # environments silently break.
+        for line in self._read("requirements.txt").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            self.assertIn("==", line, f"unpinned dependency: {line!r}")
+
     def test_no_duplicate_position_size(self):
         # position_size must live only in trading_math now (single source of truth).
         self.assertNotIn("def position_size", self._read("bot.py"))
