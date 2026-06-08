@@ -503,13 +503,15 @@ class TestSourceGuards(unittest.TestCase):
         # position_size must live only in trading_math now (single source of truth).
         self.assertNotIn("def position_size", self._read("bot.py"))
 
-    def test_ps1_files_are_pure_ascii(self):
-        # Windows PowerShell 5.1 reads a no-BOM .ps1 as Windows-1252, so a single
-        # non-ASCII char (e.g. an em-dash pasted into a string) silently corrupts
-        # parsing — the script dies at launch with NO log line. This actually
-        # happened to watchdog.ps1. Keep every .ps1 pure ASCII.
+    def test_shell_scripts_are_pure_ascii(self):
+        # Windows PowerShell 5.1 / cmd.exe read a no-BOM script in the legacy
+        # Windows-1252 codepage, so a single non-ASCII char (e.g. an em-dash
+        # pasted into a string) silently corrupts parsing — the script dies at
+        # launch with NO log line. This actually happened to watchdog.ps1. Keep
+        # every .ps1 and .bat pure ASCII.
         import glob
-        for path in glob.glob(os.path.join(ROOT, "*.ps1")):
+        paths = glob.glob(os.path.join(ROOT, "*.ps1")) + glob.glob(os.path.join(ROOT, "*.bat"))
+        for path in paths:
             with open(path, "rb") as fh:
                 data = fh.read()
             bad = [(i, b) for i, b in enumerate(data) if b > 127]
