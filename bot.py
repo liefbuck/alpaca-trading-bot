@@ -14,6 +14,8 @@ import yfinance as yf
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
 from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
@@ -45,6 +47,15 @@ client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
     secret_key=os.getenv("ALPACA_SECRET_KEY"),
     paper=True,
+)
+
+# Market-data client — used to re-quote each symbol the instant before we submit
+# its bracket order, so the take-profit is priced off the live market rather than
+# the (up to ~1 min stale) screener price. A fast gapper can run past its small
+# TP offset during the scan, which made Alpaca reject the order (TP < base_price).
+data_client = StockHistoricalDataClient(
+    api_key=os.getenv("ALPACA_API_KEY"),
+    secret_key=os.getenv("ALPACA_SECRET_KEY"),
 )
 
 trading_active = True
@@ -139,10 +150,83 @@ def spy_is_positive() -> bool:
 
 
 def scan_momentum() -> list:
-    """Scan S&P 500 + Nasdaq 100 + watchlist for top momentum plays."""
+    """Scan S&P 500 + Nasdaq 100 + watchlist for top momentum plays.
+
+    Returns up to 2x MAX_POSITIONS ranked candidates: the extra names are
+    backfill, so if a top pick's order is rejected the buy loop can fall through
+    to the next-best candidate instead of ending the day a position short.
+    """
     top = get_top_momentum(n=50)
     log.info(f"Top movers: {[(c['symbol'], c['change_pct']) for c in top[:5]]}")
-    return top[:MAX_POSITIONS]
+    return top[:MAX_POSITIONS * 2]
+
+
+def fresh_price(symbol: str, fallback: float) -> float:
+    """Live price for `symbol` taken right before order submit.
+
+    Returns the current ask (what a market BUY pays — matches the base_price
+    Alpaca validates the bracket against), falling back to the bid and then to
+    the supplied screener price `fallback` on any error or empty quote. Never
+    raises: a quote hiccup must not block the order.
+    """
+    try:
+        quotes = data_client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        )
+        q = quotes[symbol]
+        price = float(getattr(q, "ask_price", 0) or 0) or float(getattr(q, "bid_price", 0) or 0)
+        if price > 0:
+            return round(price, 2)
+        log.warning(f"  {symbol}: empty fresh quote — using scan price ${fallback}")
+    except Exception as e:
+        log.warning(f"  {symbol}: fresh quote failed ({e}) — using scan price ${fallback}")
+    return fallback
+
+
+def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tuple:
+    """Submit bracket buys for the ranked `candidates`.
+
+    Backfill: advance past any rejected order to the next candidate until
+    MAX_POSITIONS positions fill or the list is exhausted — a single bad order
+    (e.g. TP rejected on a fast gapper) no longer leaves the day a position short.
+    Each order is priced off a fresh quote taken at submit time.
+
+    Returns (bought_symbols, sl_order_ids).
+    """
+    bought = []
+    sl_order_ids = {}
+    for stock in candidates:
+        if len(bought) >= MAX_POSITIONS:
+            break
+        symbol = stock["symbol"]
+        price = fresh_price(symbol, stock["price"])
+        qty = position_size(price, per_pos_buying_power)
+        take_profit_price, stop_price = compute_bracket_prices(price, qty)
+        try:
+            order = client.submit_order(MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                stop_loss=StopLossRequest(stop_price=stop_price),
+            ))
+            # Capture the stop-loss leg ID so we can ratchet it later
+            sl_leg = next(
+                (leg for leg in (order.legs or [])
+                 if str(getattr(leg, "order_type", "")).lower() in ("stop", "stop_limit")),
+                None,
+            )
+            if sl_leg:
+                sl_order_ids[symbol] = str(sl_leg.id)
+            else:
+                log.warning(f"  {symbol}: bracket SL leg not returned — step stops disabled for this position")
+            log.info(f"BUY {qty}x {symbol} ~${price} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
+            bought.append(symbol)
+        except Exception as e:
+            log.error(f"Order failed {symbol}: {e} — advancing to next candidate")
+    return bought, sl_order_ids
 
 
 def open_positions():
@@ -199,37 +283,7 @@ def open_positions():
     acct = get_account()
     per_pos_buying_power = float(acct.buying_power) / MAX_POSITIONS
 
-    bought = []
-    sl_order_ids = {}
-
-    for stock in top:
-        qty = position_size(stock["price"], per_pos_buying_power)
-        price = stock["price"]
-        take_profit_price, stop_price = compute_bracket_prices(price, qty)
-        try:
-            order = client.submit_order(MarketOrderRequest(
-                symbol=stock["symbol"],
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(limit_price=take_profit_price),
-                stop_loss=StopLossRequest(stop_price=stop_price),
-            ))
-            # Capture the stop-loss leg ID so we can ratchet it later
-            sl_leg = next(
-                (leg for leg in (order.legs or [])
-                 if str(getattr(leg, "order_type", "")).lower() in ("stop", "stop_limit")),
-                None,
-            )
-            if sl_leg:
-                sl_order_ids[stock["symbol"]] = str(sl_leg.id)
-            else:
-                log.warning(f"  {stock['symbol']}: bracket SL leg not returned — step stops disabled for this position")
-            log.info(f"BUY {qty}x {stock['symbol']} ~${price} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
-            bought.append(stock["symbol"])
-        except Exception as e:
-            log.error(f"Order failed {stock['symbol']}: {e}")
+    bought, sl_order_ids = _place_bracket_orders(top, per_pos_buying_power)
 
     if bought:
         state = load_state()

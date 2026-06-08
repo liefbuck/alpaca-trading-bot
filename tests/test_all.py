@@ -306,6 +306,85 @@ class TestScreener(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 3b. Order placement: backfill on rejection + fresh quote at submit
+# ──────────────────────────────────────────────────────────────────────────────
+class TestBackfillAndFreshQuote(unittest.TestCase):
+    def _candidates(self, n):
+        return [{"symbol": f"S{i}", "price": 100.0, "change_pct": 1.0,
+                 "rel_vol": 2.0, "vol_trend": 1.0} for i in range(n)]
+
+    def _fake_order(self, symbol):
+        leg = mock.MagicMock(order_type="stop", id=f"sl-{symbol}")
+        return mock.MagicMock(legs=[leg])
+
+    def test_backfill_skips_rejected_order(self):
+        # The morning-of bug: top pick's bracket is rejected. We must still fill
+        # MAX_POSITIONS by falling through to the next-best (backfill) candidate.
+        import bot
+        cands = self._candidates(MAX_POSITIONS + 1)  # one spare for backfill
+
+        def submit(req):
+            if req.symbol == "S0":
+                raise RuntimeError("take_profit.limit_price must be >= base_price + 0.01")
+            return self._fake_order(req.symbol)
+
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "fresh_price", side_effect=lambda s, f: f):
+            c.submit_order.side_effect = submit
+            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
+
+        self.assertEqual(len(bought), MAX_POSITIONS)   # not short despite S0 failing
+        self.assertNotIn("S0", bought)
+        self.assertEqual(set(sl_ids), set(bought))     # every fill tracked its SL leg
+
+    def test_caps_at_max_positions(self):
+        import bot
+        cands = self._candidates(MAX_POSITIONS * 2)
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "fresh_price", side_effect=lambda s, f: f):
+            c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
+            bought, _ = bot._place_bracket_orders(cands, 1_000_000)
+        self.assertEqual(len(bought), MAX_POSITIONS)   # never overbuys past the cap
+
+    def test_all_rejected_returns_empty(self):
+        import bot
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "fresh_price", side_effect=lambda s, f: f):
+            c.submit_order.side_effect = RuntimeError("nope")
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(3), 1_000_000)
+        self.assertEqual(bought, [])
+        self.assertEqual(sl_ids, {})
+
+    def test_scan_returns_backfill_candidates(self):
+        import bot
+        fake = [{"symbol": f"S{i}", "change_pct": i} for i in range(50)]
+        with mock.patch.object(bot, "get_top_momentum", return_value=fake):
+            out = bot.scan_momentum()
+        self.assertEqual(out, fake[:MAX_POSITIONS * 2])  # ranked spares kept for backfill
+
+    def test_fresh_price_prefers_ask(self):
+        import bot
+        q = mock.MagicMock(ask_price=50.0, bid_price=49.0)
+        with mock.patch.object(bot, "data_client") as dc:
+            dc.get_stock_latest_quote.return_value = {"AAPL": q}
+            self.assertEqual(bot.fresh_price("AAPL", 999.0), 50.0)
+
+    def test_fresh_price_falls_back_to_bid(self):
+        import bot
+        q = mock.MagicMock(ask_price=0, bid_price=49.0)
+        with mock.patch.object(bot, "data_client") as dc:
+            dc.get_stock_latest_quote.return_value = {"AAPL": q}
+            self.assertEqual(bot.fresh_price("AAPL", 999.0), 49.0)
+
+    def test_fresh_price_falls_back_to_scan_on_error(self):
+        # A quote hiccup must never block the order — fall back to the scan price.
+        import bot
+        with mock.patch.object(bot, "data_client") as dc:
+            dc.get_stock_latest_quote.side_effect = RuntimeError("data feed down")
+            self.assertEqual(bot.fresh_price("AAPL", 123.45), 123.45)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 4. Static guards — keep earlier fixes from silently regressing
 # ──────────────────────────────────────────────────────────────────────────────
 class TestSourceGuards(unittest.TestCase):
