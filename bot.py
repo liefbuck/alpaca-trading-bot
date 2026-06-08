@@ -161,26 +161,40 @@ def scan_momentum() -> list:
     return top[:MAX_POSITIONS * 2]
 
 
-def fresh_price(symbol: str, fallback: float) -> float:
-    """Live price for `symbol` taken right before order submit.
+def fresh_prices(symbols: list, fallbacks: dict) -> dict:
+    """Live prices for `symbols`, fetched in ONE quote request before the buy loop.
 
-    Returns the current ask (what a market BUY pays — matches the base_price
-    Alpaca validates the bracket against), falling back to the bid and then to
-    the supplied screener price `fallback` on any error or empty quote. Never
-    raises: a quote hiccup must not block the order.
+    The bug we are guarding against is the ~1-minute staleness of the screener
+    price (a fast gapper runs past its small take-profit offset during the scan,
+    so Alpaca rejects the bracket for TP < base_price). The sub-second buy loop
+    is not the problem, so a single batched re-quote here — rather than one call
+    per candidate — kills the staleness without N round-trips of added latency.
+
+    Returns {symbol: price}. Each price is the current ask (what a market BUY
+    pays, matching Alpaca's bracket base_price), falling back to the bid and then
+    to `fallbacks[symbol]` (the screener price) when a quote is missing or zero.
+    Never raises: if the whole request fails, every symbol falls back to its scan
+    price (logged once) and the backfill loop absorbs any resulting rejection.
     """
+    out = dict(fallbacks)
     try:
         quotes = data_client.get_stock_latest_quote(
-            StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            StockLatestQuoteRequest(symbol_or_symbols=symbols)
         )
-        q = quotes[symbol]
+    except Exception as e:
+        log.warning(f"Fresh quote batch failed ({e}) — using scan prices for {len(symbols)} symbol(s)")
+        return out
+    for sym in symbols:
+        q = quotes.get(sym)
+        if q is None:
+            log.warning(f"  {sym}: no fresh quote returned — using scan price ${out[sym]}")
+            continue
         price = float(getattr(q, "ask_price", 0) or 0) or float(getattr(q, "bid_price", 0) or 0)
         if price > 0:
-            return round(price, 2)
-        log.warning(f"  {symbol}: empty fresh quote — using scan price ${fallback}")
-    except Exception as e:
-        log.warning(f"  {symbol}: fresh quote failed ({e}) — using scan price ${fallback}")
-    return fallback
+            out[sym] = round(price, 2)
+        else:
+            log.warning(f"  {sym}: empty fresh quote — using scan price ${out[sym]}")
+    return out
 
 
 def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tuple:
@@ -189,17 +203,21 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
     Backfill: advance past any rejected order to the next candidate until
     MAX_POSITIONS positions fill or the list is exhausted — a single bad order
     (e.g. TP rejected on a fast gapper) no longer leaves the day a position short.
-    Each order is priced off a fresh quote taken at submit time.
+    Every order is priced off a fresh quote taken (in one batch) at submit time.
 
     Returns (bought_symbols, sl_order_ids).
     """
+    prices = fresh_prices(
+        [s["symbol"] for s in candidates],
+        {s["symbol"]: s["price"] for s in candidates},
+    )
     bought = []
     sl_order_ids = {}
     for stock in candidates:
         if len(bought) >= MAX_POSITIONS:
             break
         symbol = stock["symbol"]
-        price = fresh_price(symbol, stock["price"])
+        price = prices[symbol]
         qty = position_size(price, per_pos_buying_power)
         take_profit_price, stop_price = compute_bracket_prices(price, qty)
         try:
