@@ -94,7 +94,15 @@ def get_daily_pnl() -> float:
     state = load_state()
     baseline = state.get("session_baseline")
     if baseline is None:
-        baseline = float(acct.last_equity)
+        # No baseline in state (fresh boot, or a corrupted/half-synced state
+        # file). Measuring against last_equity (yesterday's CLOSE) would read
+        # the whole overnight+intraday move as "today's" P&L — on a gap-down day
+        # that can look like a >$300 loss and FALSE-TRIP the kill switch, closing
+        # everything. Fall back to CURRENT equity instead → P&L 0 for this tick;
+        # daily_reset / startup restores a real baseline immediately after.
+        log.warning("get_daily_pnl: no session_baseline in state — using current "
+                    "equity (P&L 0 this tick) to avoid a false loss-limit halt.")
+        baseline = float(acct.equity)
     return float(acct.equity) - baseline
 
 
@@ -446,11 +454,15 @@ def check_pnl():
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
 
     steps_reached = load_state().get("stop_steps_reached", {})
-    for pos in client.get_all_positions():
-        pl   = float(pos.unrealized_pl)
-        step = steps_reached.get(pos.symbol)
-        stop_note = f" [stop locked at ${step:+.0f}]" if step is not None else " [stop at initial]"
-        log.info(f"  {pos.symbol}  P&L ${pl:+.2f}{stop_note}")
+    try:
+        for pos in client.get_all_positions():
+            pl   = float(pos.unrealized_pl)
+            step = steps_reached.get(pos.symbol)
+            stop_note = f" [stop locked at ${step:+.0f}]" if step is not None else " [stop at initial]"
+            log.info(f"  {pos.symbol}  P&L ${pl:+.2f}{stop_note}")
+    except Exception as e:
+        # A transient read failure here must not abort the loss-limit check below.
+        log.warning(f"check_pnl: position readout failed ({e}) — continuing to limit check.")
 
     if daily_pnl <= DAILY_LOSS_LIMIT:
         log.info(f"DAILY LOSS LIMIT HIT ${daily_pnl:.2f} — cancelling brackets and halting.")
@@ -499,14 +511,20 @@ def eod_close():
     # At 15:45 ET a normal session is still open (closes 16:00), so is_open
     # cleanly identifies trading days. On weekends/holidays, skip the whole EOD
     # routine so we don't append an empty entry to performance_log.json.
+    market_confirmed_open = False
     try:
         if not client.get_clock().is_open:
             log.info("EOD: non-trading day (weekend/holiday) — skipping summary.")
             persist_halted(False)
             trading_active = False
             return
+        market_confirmed_open = True
     except Exception as e:
-        log.warning(f"EOD: clock check failed ({e}) — proceeding with close.")
+        # Can't confirm whether today is a trading day. Still close positions for
+        # safety (never leave them carried overnight), but DON'T write a
+        # performance row — on a weekend/holiday blip that would append a spurious
+        # 0-trade "WIN" for a non-trading day.
+        log.warning(f"EOD: clock check failed ({e}) — closing for safety, skipping summary.")
 
     log.info("EOD: Force-closing all positions.")
     # Catch any bracket orders that fired in the last few seconds before EOD.
@@ -520,10 +538,11 @@ def eod_close():
     except Exception as e:
         log.error(f"EOD trade recording error: {e}")
     close_all()
-    try:
-        log_daily_performance()
-    except Exception as e:
-        log.error(f"EOD: failed to write performance log ({e}) — continuing shutdown.")
+    if market_confirmed_open:
+        try:
+            log_daily_performance()
+        except Exception as e:
+            log.error(f"EOD: failed to write performance log ({e}) — continuing shutdown.")
     persist_halted(False)  # Reset for next day — write before flipping memory flag
     trading_active = False
 

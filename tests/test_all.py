@@ -185,6 +185,42 @@ class TestEodWeekendGuard(unittest.TestCase):
             perf.assert_called_once()
             close_all.assert_called_once()
 
+    def test_clock_failure_closes_but_skips_summary(self):
+        # A clock-check blip must still force-close (safety) but must NOT write a
+        # performance row (we can't confirm it's a trading day -> no spurious entry).
+        import bot
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "log_daily_performance") as perf, \
+             mock.patch.object(bot, "close_all") as close_all, \
+             mock.patch.object(bot, "sync_bracket_fills"), \
+             mock.patch.object(bot, "persist_halted"):
+            c.get_clock.side_effect = RuntimeError("network")
+            c.get_all_positions.return_value = []
+            bot.trading_active = True
+            bot.eod_close()
+            close_all.assert_called_once()
+            perf.assert_not_called()
+
+
+class TestDailyPnlBaseline(unittest.TestCase):
+    def test_missing_baseline_uses_current_equity_not_last(self):
+        # No baseline -> P&L 0 (current equity), NOT a huge loss vs yesterday's
+        # close, which would false-trip the kill switch.
+        import bot
+        acct = mock.MagicMock(equity="50000", last_equity="40000")
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "load_state", return_value={}):
+            c.get_account.return_value = acct
+            self.assertEqual(bot.get_daily_pnl(), 0.0)
+
+    def test_uses_baseline_when_present(self):
+        import bot
+        acct = mock.MagicMock(equity="50200", last_equity="40000")
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "load_state", return_value={"session_baseline": 50000.0}):
+            c.get_account.return_value = acct
+            self.assertEqual(round(bot.get_daily_pnl(), 2), 200.0)
+
 
 class TestDailyResetWeekendGuard(unittest.TestCase):
     def test_no_reset_on_non_trading_day(self):
@@ -434,6 +470,13 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn("try {", src)            # self-heal guard
         self.assertIn("Get-PidFile", src)      # pid-file tracking
         self.assertIn("Get-Process -Id", src)  # reliable liveness check
+
+    def test_watchdog_path_independent(self):
+        # The watchdog must derive its dir from its own location, not a hardcoded
+        # OneDrive path (the repo was moved out of OneDrive to avoid sync corruption).
+        src = self._read("watchdog.ps1")
+        self.assertIn("$PSScriptRoot", src)
+        self.assertNotIn("OneDrive", src)
 
     def test_startps1_kill_is_scoped(self):
         src = self._read("start.ps1")
