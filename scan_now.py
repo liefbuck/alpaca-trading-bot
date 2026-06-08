@@ -36,6 +36,9 @@ acct = client.get_account()
 buying_power = float(acct.buying_power)
 
 print("\n=== PLACING ORDERS ===")
+print("  NOTE: manual tool. These positions are protected by their bracket TP/SL")
+print("  and are force-closed at EOD, but are NOT written to bot_state.json, so the")
+print("  running bot will NOT ladder their trailing stops or log them per-trade.\n")
 for stock in picks:
     price = stock["price"]
     qty = position_size(price, buying_power / MAX_POSITIONS)
