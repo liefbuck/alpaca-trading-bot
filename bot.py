@@ -13,7 +13,7 @@ import yfinance as yf
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass, OrderType
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from screener import get_top_momentum
@@ -238,10 +238,15 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
                 take_profit=TakeProfitRequest(limit_price=take_profit_price),
                 stop_loss=StopLossRequest(stop_price=stop_price),
             ))
-            # Capture the stop-loss leg ID so we can ratchet it later
+            # Capture the stop-loss leg ID so we can ratchet it later.
+            # IMPORTANT: leg.order_type is an OrderType enum. str(OrderType.STOP)
+            # is 'OrderType.STOP' (NOT 'stop'), so the old str(...).lower() check
+            # never matched and step stops were silently disabled for EVERY order.
+            # OrderType is a (str, Enum), so == against the enum members matches
+            # whether the API returns the enum or the plain "stop" string.
             sl_leg = next(
                 (leg for leg in (order.legs or [])
-                 if str(getattr(leg, "order_type", "")).lower() in ("stop", "stop_limit")),
+                 if getattr(leg, "order_type", None) in (OrderType.STOP, OrderType.STOP_LIMIT)),
                 None,
             )
             if sl_leg:

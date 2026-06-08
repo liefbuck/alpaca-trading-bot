@@ -350,13 +350,31 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
                  "rel_vol": 2.0, "vol_trend": 1.0} for i in range(n)]
 
     def _fake_order(self, symbol):
-        leg = mock.MagicMock(order_type="stop", id=f"sl-{symbol}")
-        return mock.MagicMock(legs=[leg])
+        # Mirror a REAL Alpaca bracket response: two legs (a LIMIT take-profit and
+        # a STOP stop-loss), each order_type being the actual OrderType ENUM — NOT
+        # a plain "stop" string. The old mock used "stop", which hid a bug where
+        # str(OrderType.STOP) == 'OrderType.STOP' so the SL leg was never matched.
+        from alpaca.trading.enums import OrderType, OrderSide
+        tp = mock.MagicMock(order_type=OrderType.LIMIT, id=f"tp-{symbol}", side=OrderSide.SELL)
+        sl = mock.MagicMock(order_type=OrderType.STOP,  id=f"sl-{symbol}", side=OrderSide.SELL)
+        return mock.MagicMock(legs=[tp, sl])
 
     # Patch the batched quote fetch to an identity (fresh price == scan price) so
     # the order-placement tests exercise backfill/cap logic without a data client.
     def _identity_prices(self, syms, fallbacks):
         return dict(fallbacks)
+
+    def test_captures_stop_loss_leg_id(self):
+        # Regression for the silent dead-ladder bug: leg.order_type is an
+        # OrderType ENUM, and the SL leg must be captured (by the STOP leg, not
+        # the LIMIT take-profit leg) so step_trailing_stops can ratchet it later.
+        import bot
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
+            c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, ["S0"])
+        self.assertEqual(sl_ids, {"S0": "sl-S0"})   # the STOP leg id, not "tp-S0"
 
     def test_backfill_skips_rejected_order(self):
         # The morning-of bug: top pick's bracket is rejected. We must still fill
