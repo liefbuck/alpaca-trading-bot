@@ -7,3 +7,4 @@ config.js
 # Runtime artifacts
 step_alerts.log
 .watchdog_*.pid
+install_boot_task.log

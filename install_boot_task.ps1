@@ -1,28 +1,45 @@
-# Registers a SYSTEM "at startup" scheduled task so the trading watchdog launches
-# at boot, BEFORE any user logs in. This is what makes the bot survive an
-# unattended overnight reboot (e.g. a forced Windows Update) instead of sitting
-# dead until someone logs in.
+# Installs a SYSTEM "at startup" scheduled task so the trading watchdog launches
+# at boot, BEFORE any user logs in -- this is what makes the bot survive an
+# unattended overnight reboot (e.g. a forced Windows Update).
 #
-# EASIEST: just double-click  install_boot_task.bat  and click YES on the UAC
-# prompt. That self-elevates and runs this script for you.
+# EASIEST: double-click  install_boot_task.bat  and click YES on the UAC prompt.
+# This script self-elevates, so running it directly works too. It writes the
+# outcome to  install_boot_task.log  so the result is visible even if the window
+# closes.
 #
-# (Manual alternative: right-click Windows PowerShell -> Run as administrator,
-#  then:  & "C:\ClaudeTrading\install_boot_task.ps1")
-#
-# The per-user logon task (ClaudeTrading-Watchdog) still handles the normal
-# logged-in case and shows live toast popups. Under an unattended-reboot session
-# the bot runs in session 0, so toasts won't pop, but trading and step_alerts.log
-# work normally. The watchdog's singleton lock keeps the two tasks from clashing.
-$ErrorActionPreference = "Stop"
+# The per-user logon task (ClaudeTrading-Watchdog) already covers the normal
+# logged-in case with live toasts. Under an unattended-reboot session the bot
+# runs in session 0 (no toast popups) but trading + step_alerts.log work. The
+# watchdog's singleton lock keeps the two tasks from clashing.
 
-try {
-    $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Not elevated. Double-click install_boot_task.bat (and click YES), or run this from an Administrator PowerShell."
+$LogFile = Join-Path $PSScriptRoot "install_boot_task.log"
+function Log($m) {
+    Add-Content -Path $LogFile -Value ("$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))  $m")
+    Write-Host $m
+}
+
+# --- Self-elevate if we are not already an administrator ---
+$identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Log "Not elevated - asking for admin via UAC (click YES)."
+    try {
+        Start-Process powershell.exe -Verb RunAs -ErrorAction Stop -ArgumentList @(
+            '-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $PSCommandPath)
+        )
+        Log "UAC accepted - an elevated window opened to finish the install."
+    } catch {
+        Log "ELEVATION CANCELLED OR FAILED: $($_.Exception.Message)"
+        Write-Host "Could not get administrator rights. Nothing was changed." -ForegroundColor Red
+        Read-Host "Press Enter to close"
     }
+    return
+}
 
+# --- Elevated from here ---
+$ErrorActionPreference = "Stop"
+try {
     $watchdog = Join-Path $PSScriptRoot "watchdog.ps1"
-    if (-not (Test-Path $watchdog)) { throw "watchdog.ps1 not found next to this script ($PSScriptRoot)." }
+    if (-not (Test-Path $watchdog)) { throw "watchdog.ps1 not found in $PSScriptRoot" }
 
     $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$watchdog`""
@@ -35,11 +52,12 @@ try {
     Register-ScheduledTask -TaskName "ClaudeTrading-Watchdog-Boot" -Action $action `
         -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
+    Log "SUCCESS: registered SYSTEM at-startup task 'ClaudeTrading-Watchdog-Boot'."
     Write-Host ""
-    Write-Host "SUCCESS: registered SYSTEM at-startup task 'ClaudeTrading-Watchdog-Boot'." -ForegroundColor Green
-    Write-Host "The bot will now start at boot even with no user logged in."
+    Write-Host "SUCCESS - the bot will now start at boot even with no user logged in." -ForegroundColor Green
 }
 catch {
+    Log "FAILED: $($_.Exception.Message)"
     Write-Host ""
     Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
 }
