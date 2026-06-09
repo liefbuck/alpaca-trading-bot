@@ -152,12 +152,14 @@ class TestSchedulesAreEasternPinned(unittest.TestCase):
         return out
 
     def test_entry_windows(self):
+        # First entry at 9:31 (earliest valid post-open start) so the ~3.5 min scan
+        # of the expanded universe starts ASAP; later windows are backups.
         self.assertEqual(self._et_minutes_for("open_positions"),
-                         {(9, 32), (9, 48), (10, 3), (10, 18)})
+                         {(9, 31), (9, 48), (10, 3), (10, 18)})
 
     def test_reset_overnight_eod(self):
         self.assertEqual(self._et_minutes_for("daily_reset"), {(9, 29)})
-        self.assertEqual(self._et_minutes_for("close_overnight"), {(9, 31)})
+        self.assertEqual(self._et_minutes_for("close_overnight"), {(9, 30)})
         self.assertEqual(self._et_minutes_for("eod_close"), {(15, 45)})
 
     def test_daily_jobs_carry_eastern_timezone(self):

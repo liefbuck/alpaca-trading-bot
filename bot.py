@@ -663,12 +663,16 @@ def close_overnight():
 # would silently misfire if this host's timezone ever differed from ET.
 TZ = "America/New_York"
 schedule.every().day.at("09:29", TZ).do(daily_reset)       # Reset at market pre-open
-schedule.every().day.at("09:31", TZ).do(close_overnight)   # Close any overnight positions
+schedule.every().day.at("09:30", TZ).do(close_overnight)   # Close any overnight positions (at the open, before entry)
 schedule.every(5).seconds.do(check_pnl)                    # P&L check every 5 sec
 schedule.every().day.at("15:45", TZ).do(eod_close)         # Force-close before EOD
 
-# Entry attempts every 15 min from 9:32 to 10:18 — stops after 10:30 or once positions are open
-for _t in ["09:32", "09:48", "10:03", "10:18"]:
+# First entry fires at 9:31 — the earliest the market is reliably open with real
+# gap data — so the ~3.5 min scan (now ~1,521 tickers) starts ASAP and fills land
+# ~9:34:30 instead of ~9:35:30. The scan can't run pre-open (orders are rejected
+# before 9:30 and there's no opening-gap data yet), so 9:31 is the earliest valid
+# start. Later windows are backups: they no-op once positions are held or after 10:30.
+for _t in ["09:31", "09:48", "10:03", "10:18"]:
     schedule.every().day.at(_t, TZ).do(open_positions)
 
 def wait_for_network(max_wait_seconds: int = 300, interval: int = 15):
@@ -730,12 +734,12 @@ if __name__ == "__main__":
             trading_active = False
             log.info("Startup: trading was halted (loss limit hit earlier today) — not resuming.")
 
-    # Catchup: if we start/restart during the trading window (after 09:33, before EOD)
-    # and hold no positions, run open_positions() immediately so a restart never
-    # causes us to sit out the whole day.
+    # Catchup: if we start/restart during the trading window (after the 09:31 first
+    # entry, before EOD) and hold no positions, run open_positions() immediately so a
+    # restart never causes us to sit out the whole day.
     # Skip if trading was halted earlier today.
     now_et = datetime.now(ET)
-    market_open_time = now_et.replace(hour=9, minute=32, second=0, microsecond=0)
+    market_open_time = now_et.replace(hour=9, minute=31, second=0, microsecond=0)
     entry_cutoff     = now_et.replace(hour=10, minute=30, second=0, microsecond=0)
     if trading_active and market_open_time <= now_et < entry_cutoff:
         existing = client.get_all_positions()
