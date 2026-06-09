@@ -401,87 +401,141 @@ class TestScreener(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3b. Order placement: backfill on rejection + fresh quote at submit
+# 3b. Order placement: two-step entry (bare market buy -> OCO exit priced off the
+#     REAL fill) with backfill on any failure.
+#
+# This replaces the old single-BRACKET path. A bracket's TP/SL legs were priced
+# off our pre-trade quote and validated by Alpaca against ITS base_price; when the
+# two disagreed by more than the ~1% leg offset (routine at the open) Alpaca
+# rejected the WHOLE order, so only a few of MAX_POSITIONS filled (4/10 on 06/09).
+# The two-step flow has no second price to disagree with: the exit straddles the
+# live market, computed from the genuine fill.
 # ──────────────────────────────────────────────────────────────────────────────
-class TestBackfillAndFreshQuote(unittest.TestCase):
+class TestTwoStepEntryAndBackfill(unittest.TestCase):
     def _candidates(self, n):
         return [{"symbol": f"S{i}", "price": 100.0, "change_pct": 1.0,
                  "rel_vol": 2.0, "vol_trend": 1.0} for i in range(n)]
 
-    def _fake_order(self, symbol):
-        # Mirror a REAL Alpaca bracket response: two legs (a LIMIT take-profit and
-        # a STOP stop-loss), each order_type being the actual OrderType ENUM — NOT
-        # a plain "stop" string. The old mock used "stop", which hid a bug where
-        # str(OrderType.STOP) == 'OrderType.STOP' so the SL leg was never matched.
-        from alpaca.trading.enums import OrderType, OrderSide
-        tp = mock.MagicMock(order_type=OrderType.LIMIT, id=f"tp-{symbol}", side=OrderSide.SELL)
-        sl = mock.MagicMock(order_type=OrderType.STOP,  id=f"sl-{symbol}", side=OrderSide.SELL)
-        return mock.MagicMock(legs=[tp, sl])
+    def _fake_buy(self, symbol):
+        return mock.MagicMock(id=f"buy-{symbol}")
 
-    # Patch the batched quote fetch to an identity (fresh price == scan price) so
-    # the order-placement tests exercise backfill/cap logic without a data client.
-    def _identity_prices(self, syms, fallbacks):
-        return dict(fallbacks)
+    def _filled(self, qty=10, price=100.0):
+        # A fully-filled buy order as get_order_by_id would return it.
+        return mock.MagicMock(status=mock.MagicMock(value="filled"),
+                              filled_qty=str(qty), filled_avg_price=str(price))
+
+    def _fake_oco(self, symbol):
+        # Mirror a REAL Alpaca OCO response: the PARENT order is the take-profit
+        # LIMIT; the stop-loss is a child leg whose order_type is the STOP enum
+        # (NOT a plain "stop" string — that distinction hid the old dead-ladder bug).
+        from alpaca.trading.enums import OrderType, OrderSide
+        stop = mock.MagicMock(order_type=OrderType.STOP, id=f"sl-{symbol}", side=OrderSide.SELL)
+        return mock.MagicMock(order_type=OrderType.LIMIT, id=f"tp-{symbol}", legs=[stop])
+
+    def _wire(self, c, buy_ok=lambda s: True, oco_ok=lambda s: True):
+        """Configure a mocked client for the two-step flow. buy_ok / oco_ok
+        returning False raises on that step to simulate a rejection."""
+        from alpaca.trading.enums import OrderSide
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                if not buy_ok(req.symbol):
+                    raise RuntimeError("buy rejected")
+                return self._fake_buy(req.symbol)
+            if not oco_ok(req.symbol):           # SELL == the OCO exit
+                raise RuntimeError("stop_loss.stop_price must be <= base_price - 0.01")
+            return self._fake_oco(req.symbol)
+
+        c.submit_order.side_effect = submit
+        c.get_order_by_id.side_effect = lambda oid: self._filled()
 
     def test_captures_stop_loss_leg_id(self):
-        # Regression for the silent dead-ladder bug: leg.order_type is an
-        # OrderType ENUM, and the SL leg must be captured (by the STOP leg, not
-        # the LIMIT take-profit leg) so step_trailing_stops can ratchet it later.
+        # The STOP leg id (not the TP-limit parent) must be captured so
+        # step_trailing_stops can ratchet it later.
         import bot
-        with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
-            c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
+        with mock.patch.object(bot, "client") as c:
+            self._wire(c)
             bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
         self.assertEqual(bought, ["S0"])
         self.assertEqual(sl_ids, {"S0": "sl-S0"})   # the STOP leg id, not "tp-S0"
 
-    def test_backfill_skips_rejected_order(self):
-        # The morning-of bug: top pick's bracket is rejected. We must still fill
-        # MAX_POSITIONS by falling through to the next-best (backfill) candidate.
+    def test_exit_priced_off_real_fill_not_scan_price(self):
+        # The core of the fix: TP/SL come from the ACTUAL fill (250.0), never the
+        # scan price (100.0), and straddle it — so Alpaca can't reject them.
         import bot
-        cands = self._candidates(MAX_POSITIONS + 1)  # one spare for backfill
+        from alpaca.trading.enums import OrderSide
+        captured = {}
 
         def submit(req):
-            if req.symbol == "S0":
-                raise RuntimeError("take_profit.limit_price must be >= base_price + 0.01")
-            return self._fake_order(req.symbol)
+            if req.side == OrderSide.BUY:
+                return self._fake_buy(req.symbol)
+            captured["tp"] = float(req.take_profit.limit_price)
+            captured["sl"] = float(req.stop_loss.stop_price)
+            return self._fake_oco(req.symbol)
 
-        with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
+        with mock.patch.object(bot, "client") as c:
             c.submit_order.side_effect = submit
-            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
+            c.get_order_by_id.side_effect = lambda oid: self._filled(qty=10, price=250.0)
+            bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertGreater(captured["tp"], 250.0)   # take-profit above the fill
+        self.assertLess(captured["sl"], 250.0)      # stop below the fill
 
+    def test_backfill_skips_rejected_buy(self):
+        # Top pick's buy is rejected -> still fill MAX_POSITIONS off the spares.
+        import bot
+        cands = self._candidates(MAX_POSITIONS + 1)
+        with mock.patch.object(bot, "client") as c:
+            self._wire(c, buy_ok=lambda s: s != "S0")
+            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
         self.assertEqual(len(bought), MAX_POSITIONS)   # not short despite S0 failing
         self.assertNotIn("S0", bought)
         self.assertEqual(set(sl_ids), set(bought))     # every fill tracked its SL leg
 
+    def test_oco_rejection_closes_position_and_backfills(self):
+        # If the protective exit is rejected we must NEVER carry the position
+        # unprotected: close it, then backfill to the next candidate.
+        import bot
+        cands = self._candidates(MAX_POSITIONS + 1)
+        with mock.patch.object(bot, "client") as c:
+            self._wire(c, oco_ok=lambda s: s != "S0")
+            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
+        self.assertEqual(len(bought), MAX_POSITIONS)
+        self.assertNotIn("S0", bought)
+        c.close_position.assert_called_once_with("S0")   # flattened, never carried
+
+    def test_unfilled_buy_is_cancelled_and_skipped(self):
+        # A buy that never reaches 'filled' is cancelled and skipped (no orphan).
+        import bot
+        from alpaca.trading.enums import OrderSide
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                return self._fake_buy(req.symbol)
+            return self._fake_oco(req.symbol)
+
+        with mock.patch.object(bot, "client") as c:
+            c.submit_order.side_effect = submit
+            c.get_order_by_id.side_effect = lambda oid: mock.MagicMock(
+                status=mock.MagicMock(value="rejected"), filled_qty="0", filled_avg_price=None)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, [])
+        c.cancel_order_by_id.assert_called_once()
+
     def test_caps_at_max_positions(self):
         import bot
         cands = self._candidates(MAX_POSITIONS * 2)
-        with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
-            c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
+        with mock.patch.object(bot, "client") as c:
+            self._wire(c)
             bought, _ = bot._place_bracket_orders(cands, 1_000_000)
         self.assertEqual(len(bought), MAX_POSITIONS)   # never overbuys past the cap
 
     def test_all_rejected_returns_empty(self):
         import bot
-        with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices):
-            c.submit_order.side_effect = RuntimeError("nope")
+        with mock.patch.object(bot, "client") as c:
+            self._wire(c, buy_ok=lambda s: False)
             bought, sl_ids = bot._place_bracket_orders(self._candidates(3), 1_000_000)
         self.assertEqual(bought, [])
         self.assertEqual(sl_ids, {})
-
-    def test_quotes_fetched_once_for_whole_batch(self):
-        # Note-1 fix: one quote round-trip for all candidates, not one per order.
-        import bot
-        cands = self._candidates(MAX_POSITIONS * 2)
-        with mock.patch.object(bot, "client") as c, \
-             mock.patch.object(bot, "fresh_prices", side_effect=self._identity_prices) as fp:
-            c.submit_order.side_effect = lambda req: self._fake_order(req.symbol)
-            bot._place_bracket_orders(cands, 1_000_000)
-        self.assertEqual(fp.call_count, 1)
 
     def test_scan_returns_backfill_candidates(self):
         import bot
@@ -490,38 +544,68 @@ class TestBackfillAndFreshQuote(unittest.TestCase):
             out = bot.scan_momentum()
         self.assertEqual(out, fake[:MAX_POSITIONS * 2])  # ranked spares kept for backfill
 
-    def test_fresh_prices_prefers_ask(self):
-        import bot
-        q = mock.MagicMock(ask_price=50.0, bid_price=49.0)
-        with mock.patch.object(bot, "data_client") as dc:
-            dc.get_stock_latest_quote.return_value = {"AAA": q}
-            self.assertEqual(bot.fresh_prices(["AAA"], {"AAA": 999.0})["AAA"], 50.0)
 
-    def test_fresh_prices_falls_back_to_bid(self):
-        import bot
-        q = mock.MagicMock(ask_price=0, bid_price=49.0)
-        with mock.patch.object(bot, "data_client") as dc:
-            dc.get_stock_latest_quote.return_value = {"AAA": q}
-            self.assertEqual(bot.fresh_prices(["AAA"], {"AAA": 999.0})["AAA"], 49.0)
+# ──────────────────────────────────────────────────────────────────────────────
+# 3c. Trade recording: a closed position must never be dropped from `positions`
+#     until its P&L is actually recorded (the 06/09 lost-trades bug).
+# ──────────────────────────────────────────────────────────────────────────────
+class TestSyncBracketFillsRecording(unittest.TestCase):
+    def _state_backed(self, store):
+        import copy
+        def load():
+            return copy.deepcopy(store)
+        def save(d):
+            store.clear(); store.update(copy.deepcopy(d))
+        return load, save
 
-    def test_fresh_prices_missing_symbol_uses_scan(self):
-        # A symbol absent from the quote response keeps its scan price.
-        import bot
-        q = mock.MagicMock(ask_price=50.0, bid_price=49.0)
-        with mock.patch.object(bot, "data_client") as dc:
-            dc.get_stock_latest_quote.return_value = {"AAA": q}  # BBB missing
-            out = bot.fresh_prices(["AAA", "BBB"], {"AAA": 999.0, "BBB": 123.0})
-        self.assertEqual(out["AAA"], 50.0)
-        self.assertEqual(out["BBB"], 123.0)
+    def _order(self, side, price, qty):
+        import datetime as dt, pytz
+        ET = pytz.timezone("America/New_York")
+        o = mock.MagicMock()
+        o.side = mock.MagicMock(value=side)
+        o.filled_avg_price = str(price)
+        o.filled_qty = str(qty)
+        o.submitted_at = dt.datetime.now(ET)   # today, ET
+        return o
 
-    def test_fresh_prices_falls_back_to_scan_on_batch_error(self):
-        # Note-2 fix: a feed failure falls every symbol back to its scan price
-        # (never raises), and backfill absorbs any resulting rejection.
+    def test_closed_position_recorded_on_retry_not_dropped(self):
+        # Cycle 1: the position has vanished from get_all_positions, but the broker's
+        # CLOSED-orders query hasn't surfaced the filled SELL yet (status lag). The
+        # symbol must be RETAINED for retry, not silently dropped (which lost the
+        # trade from the performance log on 06/09).
         import bot
-        with mock.patch.object(bot, "data_client") as dc:
-            dc.get_stock_latest_quote.side_effect = RuntimeError("data feed down")
-            out = bot.fresh_prices(["AAA", "BBB"], {"AAA": 1.0, "BBB": 2.0})
-        self.assertEqual(out, {"AAA": 1.0, "BBB": 2.0})
+        store = {"positions": ["AAA"], "trades_today": [], "sl_order_ids": {"AAA": "id1"}}
+        load, save = self._state_backed(store)
+        buy  = self._order("buy", 100.0, 10)
+        sell = self._order("sell", 105.0, 10)
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "load_state", side_effect=load), \
+             mock.patch.object(bot, "save_state", side_effect=save):
+            c.get_orders.return_value = [buy]            # only the buy has settled
+            bot.sync_bracket_fills(positions=[])
+            self.assertEqual(store["trades_today"], [])  # nothing recorded yet
+            self.assertEqual(store["positions"], ["AAA"])  # retained for retry, NOT dropped
+
+            c.get_orders.return_value = [buy, sell]      # sell now visible
+            bot.sync_bracket_fills(positions=[])
+        self.assertEqual([t["symbol"] for t in store["trades_today"]], ["AAA"])
+        self.assertEqual(store["trades_today"][0]["pl"], 50.0)   # (105-100)*10
+        self.assertEqual(store["positions"], [])                 # dropped only after recording
+
+    def test_recorded_symbol_is_dropped(self):
+        # The happy path: buy+sell both settled on the first cycle -> record + drop.
+        import bot
+        store = {"positions": ["AAA"], "trades_today": [], "sl_order_ids": {}}
+        load, save = self._state_backed(store)
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "load_state", side_effect=load), \
+             mock.patch.object(bot, "save_state", side_effect=save):
+            c.get_orders.return_value = [self._order("buy", 100.0, 10),
+                                         self._order("sell", 95.0, 10)]
+            bot.sync_bracket_fills(positions=[])
+        self.assertEqual(len(store["trades_today"]), 1)
+        self.assertEqual(store["trades_today"][0]["pl"], -50.0)
+        self.assertEqual(store["positions"], [])
 
 
 # ──────────────────────────────────────────────────────────────────────────────

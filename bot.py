@@ -12,10 +12,8 @@ from dotenv import load_dotenv
 import yfinance as yf
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass, OrderType
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
 from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
@@ -47,15 +45,6 @@ client = TradingClient(
     api_key=os.getenv("ALPACA_API_KEY"),
     secret_key=os.getenv("ALPACA_SECRET_KEY"),
     paper=True,
-)
-
-# Market-data client — used to re-quote each symbol the instant before we submit
-# its bracket order, so the take-profit is priced off the live market rather than
-# the (up to ~1 min stale) screener price. A fast gapper can run past its small
-# TP offset during the scan, which made Alpaca reject the order (TP < base_price).
-data_client = StockHistoricalDataClient(
-    api_key=os.getenv("ALPACA_API_KEY"),
-    secret_key=os.getenv("ALPACA_SECRET_KEY"),
 )
 
 trading_active = True
@@ -169,94 +158,129 @@ def scan_momentum() -> list:
     return top[:MAX_POSITIONS * 2]
 
 
-def fresh_prices(symbols: list, fallbacks: dict) -> dict:
-    """Live prices for `symbols`, fetched in ONE quote request before the buy loop.
+def _wait_for_fill(order_id, timeout: float = 8.0, poll: float = 0.3) -> tuple:
+    """Poll a submitted order until it is fully filled.
 
-    The bug we are guarding against is the ~1-minute staleness of the screener
-    price (a fast gapper runs past its small take-profit offset during the scan,
-    so Alpaca rejects the bracket for TP < base_price). The sub-second buy loop
-    is not the problem, so a single batched re-quote here — rather than one call
-    per candidate — kills the staleness without N round-trips of added latency.
-
-    Returns {symbol: price}. Each price is the current ask (what a market BUY
-    pays, matching Alpaca's bracket base_price), falling back to the bid and then
-    to `fallbacks[symbol]` (the screener price) when a quote is missing or zero.
-    Never raises: if the whole request fails, every symbol falls back to its scan
-    price (logged once) and the backfill loop absorbs any resulting rejection.
+    Returns (filled_qty, filled_avg_price) once status == 'filled', or
+    (None, None) if the order is canceled/rejected/expired or the timeout
+    elapses. Market BUYs fill in well under a second; we poll so the protective
+    exit can be priced off the REAL fill rather than a pre-trade guess.
     """
-    out = dict(fallbacks)
-    try:
-        quotes = data_client.get_stock_latest_quote(
-            StockLatestQuoteRequest(symbol_or_symbols=symbols)
-        )
-    except Exception as e:
-        log.warning(f"Fresh quote batch failed ({e}) — using scan prices for {len(symbols)} symbol(s)")
-        return out
-    for sym in symbols:
-        q = quotes.get(sym)
-        if q is None:
-            log.warning(f"  {sym}: no fresh quote returned — using scan price ${out[sym]}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            o = client.get_order_by_id(order_id)
+        except Exception:
+            time.sleep(poll)
             continue
-        price = float(getattr(q, "ask_price", 0) or 0) or float(getattr(q, "bid_price", 0) or 0)
-        if price > 0:
-            out[sym] = round(price, 2)
-        else:
-            log.warning(f"  {sym}: empty fresh quote — using scan price ${out[sym]}")
-    return out
+        status = getattr(o.status, "value", o.status)
+        if status == "filled" and o.filled_avg_price and float(o.filled_qty or 0) > 0:
+            return float(o.filled_qty), float(o.filled_avg_price)
+        if status in ("canceled", "rejected", "expired"):
+            return None, None
+        time.sleep(poll)
+    return None, None
 
 
 def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tuple:
-    """Submit bracket buys for the ranked `candidates`.
+    """Enter up to MAX_POSITIONS positions, each protected by an OCO exit.
 
-    Backfill: advance past any rejected order to the next candidate until
-    MAX_POSITIONS positions fill or the list is exhausted — a single bad order
-    (e.g. TP rejected on a fast gapper) no longer leaves the day a position short.
-    Every order is priced off a fresh quote taken (in one batch) at submit time.
+    TWO-STEP ENTRY — this is the fix for the recurring "only N of MAX filled"
+    problem. We used to submit a single BRACKET market order whose TP/SL legs
+    were priced off OUR quote, and let Alpaca validate those legs against ITS
+    own base_price at submit time. When the two prices disagreed by more than the
+    (tiny, ~1%) leg offset — routine in the volatile first minute — Alpaca
+    rejected the WHOLE order:
+      * our price below base -> TP < base+0.01  (the 06/08 MRVL rejection)
+      * our price above base -> SL > base-0.01  (the 06/09 UNP/GS/SATS/EXPD/AVGO/JPM rejections)
+    Six of ten candidates rejected on 06/09, so only four positions filled.
 
-    Returns (bought_symbols, sl_order_ids).
+    Now we (1) submit a BARE market buy — no legs, so nothing for Alpaca to
+    reject — (2) read the ACTUAL fill price, then (3) attach an OCO
+    take-profit/stop-loss exit priced off that real fill. The exit legs straddle
+    the live market (TP above, SL below) so they are always valid; there is no
+    second price left to disagree with. Risk per position stays exactly
+    PER_POSITION_TARGET / PER_POSITION_STOP because the legs are computed from the
+    genuine fill, not a guess.
+
+    Backfill is preserved: any candidate that fails to fill (or whose protective
+    exit can't be attached) is cancelled/closed and we advance to the next ranked
+    name until MAX_POSITIONS fill or the list is exhausted.
+
+    Returns (bought_symbols, sl_order_ids) where sl_order_ids[symbol] is the STOP
+    leg id so step_trailing_stops can ratchet it later.
     """
-    prices = fresh_prices(
-        [s["symbol"] for s in candidates],
-        {s["symbol"]: s["price"] for s in candidates},
-    )
     bought = []
     sl_order_ids = {}
     for stock in candidates:
         if len(bought) >= MAX_POSITIONS:
             break
         symbol = stock["symbol"]
-        price = prices[symbol]
-        qty = position_size(price, per_pos_buying_power)
-        take_profit_price, stop_price = compute_bracket_prices(price, qty)
+        qty = position_size(stock["price"], per_pos_buying_power)
+
+        # 1. Bare market buy — no legs, so it cannot be rejected for leg pricing.
         try:
-            order = client.submit_order(MarketOrderRequest(
+            buy = client.submit_order(MarketOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
+            ))
+        except Exception as e:
+            log.error(f"Order failed {symbol}: {e} — advancing to next candidate")
+            continue
+
+        # 2. Wait for the real fill so the exit is priced off it, not a guess.
+        fill_qty, fill_price = _wait_for_fill(buy.id)
+        if not fill_price:
+            log.error(f"Order failed {symbol}: buy did not fill in time — cancelling and advancing")
+            try:
+                client.cancel_order_by_id(buy.id)
+            except Exception:
+                pass
+            continue
+
+        # 3. Attach an OCO exit computed from the ACTUAL fill price. The OCO parent
+        #    is the take-profit LIMIT; the stop-loss is a child leg.
+        take_profit_price, stop_price = compute_bracket_prices(fill_price, fill_qty)
+        try:
+            exit_order = client.submit_order(LimitOrderRequest(
+                symbol=symbol,
+                qty=int(fill_qty),
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.OCO,
+                limit_price=take_profit_price,
                 take_profit=TakeProfitRequest(limit_price=take_profit_price),
                 stop_loss=StopLossRequest(stop_price=stop_price),
             ))
-            # Capture the stop-loss leg ID so we can ratchet it later.
-            # IMPORTANT: leg.order_type is an OrderType enum. str(OrderType.STOP)
-            # is 'OrderType.STOP' (NOT 'stop'), so the old str(...).lower() check
-            # never matched and step stops were silently disabled for EVERY order.
-            # OrderType is a (str, Enum), so == against the enum members matches
-            # whether the API returns the enum or the plain "stop" string.
-            sl_leg = next(
-                (leg for leg in (order.legs or [])
-                 if getattr(leg, "order_type", None) in (OrderType.STOP, OrderType.STOP_LIMIT)),
-                None,
-            )
-            if sl_leg:
-                sl_order_ids[symbol] = str(sl_leg.id)
-            else:
-                log.warning(f"  {symbol}: bracket SL leg not returned — step stops disabled for this position")
-            log.info(f"BUY {qty}x {symbol} ~${price} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
-            bought.append(symbol)
         except Exception as e:
-            log.error(f"Order failed {symbol}: {e} — advancing to next candidate")
+            # We hold an UNPROTECTED position. Never carry one: flatten it now and
+            # advance. (OCO off a real fill is almost never rejected, but if the
+            # market gapped through our stop in the sub-second since the fill, the
+            # safe move is to close rather than sit unprotected.)
+            log.error(f"Order failed {symbol}: OCO exit rejected ({e}) — closing position for safety and advancing")
+            try:
+                client.close_position(symbol)
+            except Exception as ce:
+                log.error(f"  {symbol}: FAILED to close unprotected position: {ce}")
+            continue
+
+        # Capture the STOP leg id so we can ratchet it later. leg.order_type is an
+        # OrderType enum; OrderType is a (str, Enum) so == matches whether the API
+        # returns the enum or a plain "stop" string. Search the parent and its legs
+        # (the stop is a leg of the OCO; the parent is the TP limit).
+        sl_leg = next(
+            (o for o in [exit_order, *(exit_order.legs or [])]
+             if getattr(o, "order_type", None) in (OrderType.STOP, OrderType.STOP_LIMIT)),
+            None,
+        )
+        if sl_leg:
+            sl_order_ids[symbol] = str(sl_leg.id)
+        else:
+            log.warning(f"  {symbol}: OCO stop leg not returned — step stops disabled for this position")
+        log.info(f"BUY {int(fill_qty)}x {symbol} @ ${fill_price:.2f} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
+        bought.append(symbol)
     return bought, sl_order_ids
 
 
@@ -397,7 +421,7 @@ def step_trailing_stops(positions=None):
 
 
 def sync_bracket_fills(positions=None):
-    """Detect positions closed by bracket orders and record their P&L.
+    """Detect positions closed by bracket/OCO orders and record their P&L.
     `positions` may be supplied by the caller (check_pnl) to avoid re-fetching."""
     state = load_state()
     tracked = set(state.get("positions", []))
@@ -416,6 +440,7 @@ def sync_bracket_fills(positions=None):
     today = datetime.now(ET).date()
     recorded = {t["symbol"] for t in state.get("trades_today", [])}
 
+    newly_recorded = set()
     for symbol in closed_syms:
         if symbol in recorded:
             continue
@@ -434,12 +459,26 @@ def sync_bracket_fills(positions=None):
                 pl          = round((exit_price - entry_price) * qty, 2)
                 log.info(f"Bracket closed {symbol}: entry ${entry_price:.2f} → exit ${exit_price:.2f} | P&L ${pl:+.2f}")
                 record_trade(symbol, pl)
+                newly_recorded.add(symbol)
+            else:
+                # The position is gone but the broker's CLOSED-orders query hasn't
+                # yet returned BOTH a filled buy and a filled sell — order-status
+                # propagation lags the position disappearing by a cycle or two right
+                # after a fill. Do NOT drop the symbol here: leaving it in
+                # `positions` lets the next 5s cycle retry. Unconditionally dropping
+                # every closed symbol (recorded or not) was the bug that silently
+                # lost trades from the daily performance log.
+                log.info(f"sync_bracket_fills: {symbol} closed but fills not settled yet — retrying next cycle")
         except Exception as e:
             log.warning(f"sync_bracket_fills: could not record {symbol}: {e}")
 
-    # Remove closed symbols from tracked positions in state
+    # Drop a symbol from `positions` only once its trade is actually recorded (now
+    # or on an earlier cycle). Still-open symbols and closed-but-unrecorded symbols
+    # both stay tracked, so nothing is lost. (Any genuinely unmatchable straggler is
+    # cleared by the EOD close / next-day daily_reset, so this can't leak forever.)
+    done = recorded | newly_recorded
     state = load_state()
-    state["positions"] = list(open_syms & tracked)
+    state["positions"] = [s for s in state.get("positions", []) if s not in done]
     save_state(state)
 
 
