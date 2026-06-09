@@ -1,5 +1,7 @@
 DAILY_TARGET         = 200.0
-DAILY_LOSS_LIMIT     = -300.0
+# Kill switch. 5 positions x $20 stop = $100 theoretical worst case; -140 leaves a
+# ~$40 cushion for stop slippage / gap-throughs before the day is force-halted.
+DAILY_LOSS_LIMIT     = -140.0
 PER_POSITION_STOP    = -20.0
 MAX_POSITIONS        = 5
 PER_POSITION_TARGET  = 20.0

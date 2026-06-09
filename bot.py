@@ -86,7 +86,7 @@ def get_daily_pnl() -> float:
         # No baseline in state (fresh boot, or a corrupted/half-synced state
         # file). Measuring against last_equity (yesterday's CLOSE) would read
         # the whole overnight+intraday move as "today's" P&L — on a gap-down day
-        # that can look like a >$300 loss and FALSE-TRIP the kill switch, closing
+        # that can blow past the loss limit and FALSE-TRIP the kill switch, closing
         # everything. Fall back to CURRENT equity instead → P&L 0 for this tick;
         # daily_reset / startup restores a real baseline immediately after.
         log.warning("get_daily_pnl: no session_baseline in state — using current "
