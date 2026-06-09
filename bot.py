@@ -233,9 +233,16 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
         # 2. Wait for the real fill so the exit is priced off it, not a guess.
         fill_qty, fill_price = _wait_for_fill(buy.id)
         if not fill_price:
-            log.error(f"Order failed {symbol}: buy did not fill in time — cancelling and advancing")
+            log.error(f"Order failed {symbol}: buy did not fully fill in time — cancelling and advancing")
             try:
                 client.cancel_order_by_id(buy.id)
+            except Exception:
+                pass
+            # The buy may have PARTIALLY filled before we gave up. Flatten any stray
+            # shares so we never carry an unprotected, untracked position into the
+            # session (close_position is a harmless no-op if nothing filled).
+            try:
+                client.close_position(symbol)
             except Exception:
                 pass
             continue

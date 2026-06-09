@@ -503,8 +503,9 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         self.assertNotIn("S0", bought)
         c.close_position.assert_called_once_with("S0")   # flattened, never carried
 
-    def test_unfilled_buy_is_cancelled_and_skipped(self):
-        # A buy that never reaches 'filled' is cancelled and skipped (no orphan).
+    def test_unfilled_buy_is_cancelled_and_flattened(self):
+        # A buy that never reaches 'filled' is cancelled, and any partial fill is
+        # flattened (close_position) so no unprotected/untracked shares are carried.
         import bot
         from alpaca.trading.enums import OrderSide
 
@@ -520,6 +521,7 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
             bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
         self.assertEqual(bought, [])
         c.cancel_order_by_id.assert_called_once()
+        c.close_position.assert_called_once_with("S0")   # flatten any partial
 
     def test_caps_at_max_positions(self):
         import bot
