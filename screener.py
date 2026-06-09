@@ -1,7 +1,9 @@
 """
 Dynamic universe builder.
-Pulls the S&P 500 and Nasdaq 100 from Wikipedia and batch-downloads recent
-price/volume data so both bots can score the full market instead of a fixed list.
+Pulls the S&P 500, S&P MidCap 400, S&P SmallCap 600 and Nasdaq 100 from Wikipedia
+(the S&P Composite 1500 plus Nasdaq names outside it — ~1,500 liquid tickers) and
+batch-downloads recent price/volume data so both bots can score the full market
+instead of a fixed list.
 """
 import pandas as pd
 import yfinance as yf
@@ -64,16 +66,62 @@ def get_nasdaq100() -> list:
         return FALLBACK_NDX100
 
 
+def get_sp400() -> list:
+    """Pull current S&P MidCap 400 tickers from Wikipedia."""
+    import requests
+    from io import StringIO
+    try:
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        table = pd.read_html(StringIO(resp.text), attrs={"id": "constituents"})
+        tickers = table[0]["Symbol"].tolist()
+        return [t.replace(".", "-") for t in tickers]
+    except Exception as e:
+        log.warning(f"Could not fetch S&P 400 list: {e}. Falling back to built-in list.")
+        return FALLBACK_SP400
+
+
+def get_sp600() -> list:
+    """Pull current S&P SmallCap 600 tickers from Wikipedia."""
+    import requests
+    from io import StringIO
+    try:
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; trading-bot/1.0)"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        table = pd.read_html(StringIO(resp.text), attrs={"id": "constituents"})
+        tickers = table[0]["Symbol"].tolist()
+        return [t.replace(".", "-") for t in tickers]
+    except Exception as e:
+        log.warning(f"Could not fetch S&P 600 list: {e}. Falling back to built-in list.")
+        return FALLBACK_SP600
+
+
 def get_universe() -> list:
-    """S&P 500 + Nasdaq 100 + WATCHLIST, deduplicated."""
-    sp500   = get_sp500()
-    ndx100  = get_nasdaq100()
-    seen    = set(sp500)
-    ndx_new = [t for t in ndx100 if t not in seen]
-    if ndx_new:
-        log.info(f"Nasdaq 100 adding {len(ndx_new)} ticker(s) not already in S&P 500")
-    combined = sp500 + ndx_new
-    seen.update(ndx_new)
+    """S&P 500 + MidCap 400 + SmallCap 600 + Nasdaq 100 + WATCHLIST, deduplicated.
+
+    Sources are merged in order, each contributing only the names not already
+    seen, so the S&P Composite 1500 (500+400+600) plus the few Nasdaq-100 names
+    outside it form a ~1,500-ticker liquid universe.
+    """
+    seen = set()
+    combined = []
+    for label, lst in (("S&P 500",   get_sp500()),
+                       ("S&P 400",   get_sp400()),
+                       ("S&P 600",   get_sp600()),
+                       ("Nasdaq 100", get_nasdaq100())):
+        new = [t for t in lst if t and t not in seen]
+        if combined and new:   # don't log the first (base) source
+            log.info(f"{label} adding {len(new)} ticker(s) new to the universe")
+        combined += new
+        seen.update(new)
     extras = [t for t in WATCHLIST if t not in seen]
     if extras:
         log.info(f"Watchlist adding {len(extras)} ticker(s): {extras}")
@@ -286,4 +334,25 @@ FALLBACK_NDX100 = [
     "ORLY","PANW","PAYX","PCAR","PDD","PEP","PYPL","REGN","ROP","ROST",
     "SBUX","SGEN","SIRI","SNPS","SPLK","SWKS","TEAM","TMUS","TTWO","TXN",
     "VRSK","VRSN","VRTX","WBA","WDAY","XEL","ZM","ZS",
+]
+
+# Representative liquid names only (the live Wikipedia fetch is the primary
+# source). Any stale ticker here is harmlessly skipped by the scan.
+FALLBACK_SP400 = [
+    "AA","AAL","ACM","AGCO","ALSN","BWA","CACI","CASY","CHRW","CHDN",
+    "CIEN","CLF","COHR","DKS","DOCU","EME","EWBC","EXEL","FLR","GGG",
+    "GME","GNTX","HAS","JBLU","JEF","JWN","KBR","LAD","LECO","LSCC",
+    "MANH","MAT","MUR","NVT","OLLI","OC","PB","PFGC","PNFP","PSTG",
+    "RGA","RGLD","RPM","SAIA","SF","SNX","THC","THO","TOL","TPX",
+    "TREX","TXRH","UGI","USFD","VNO","WEN","WSM","WWD","X","ZION",
+]
+
+FALLBACK_SP600 = [
+    "AAP","ABCB","ABG","ABM","ACIW","AEO","AMN","ANF","ARCB","ASO",
+    "AWR","AX","BANR","BCC","BGS","BKE","BOOT","CAL","CARG","CBRL",
+    "CENX","CNK","CRK","CRS","CVCO","CWEN","DDS","DEA","DFIN","DIN",
+    "DNOW","EAT","EPC","FUN","GEO","GFF","GVA","HELE","HIBB","HWKN",
+    "JACK","JBSS","KSS","KTB","LCII","MATX","MGY","MTRN","NPK","OII",
+    "PRDO","PZZA","ROG","SBH","SHAK","SHOO","SLVM","SXT","TGNA","TMP",
+    "TPH","UE","VIAV","VSH","WGO","WOR","WWW",
 ]
