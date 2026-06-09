@@ -64,7 +64,7 @@ def notify(title: str, message: str) -> None:
 
 def record(line: str, title: str) -> None:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(ALERT_FILE, "a") as f:
+    with open(ALERT_FILE, "a", encoding="utf-8") as f:
         f.write(f"{stamp}  {line}\n")
     notify(title, line[-200:])
 
@@ -84,10 +84,10 @@ def main() -> None:
     while not os.path.exists(LOG_FILE):
         time.sleep(POLL_SECONDS)
 
-    with open(ALERT_FILE, "a") as f:
+    with open(ALERT_FILE, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  step_watch started\n")
 
-    f = open(LOG_FILE, "r", errors="replace")
+    f = open(LOG_FILE, "r", encoding="utf-8", errors="replace")
     f.seek(0, os.SEEK_END)
     cur_id = _file_id(LOG_FILE)
 
@@ -101,7 +101,7 @@ def main() -> None:
             new_id = _file_id(LOG_FILE)
             if new_id is not None and new_id != cur_id:
                 f.close()
-                f = open(LOG_FILE, "r", errors="replace")
+                f = open(LOG_FILE, "r", encoding="utf-8", errors="replace")
                 cur_id = new_id
                 continue
             time.sleep(POLL_SECONDS)

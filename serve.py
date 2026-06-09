@@ -58,7 +58,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             history = []
             if os.path.exists(perf_path):
                 try:
-                    with open(perf_path) as f:
+                    with open(perf_path, encoding="utf-8") as f:
                         history = json.load(f)
                 except Exception:
                     history = []
@@ -76,7 +76,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             state_path = os.path.join(BASE_DIR, "bot_state.json")
             if os.path.exists(state_path):
                 try:
-                    with open(state_path) as f:
+                    with open(state_path, encoding="utf-8") as f:
                         state = json.load(f)
                 except Exception:
                     state = {}
@@ -101,8 +101,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
             target = urllib.parse.unquote(qs.get("url", [""])[0])
             parsed_target = urllib.parse.urlparse(target)
-            if parsed_target.hostname not in ("paper-api.alpaca.markets", "data.alpaca.markets"):
-                self.send_error(403, "Proxy only allows Alpaca endpoints")
+            # Pin BOTH scheme and host: without the scheme check, urlopen would
+            # honour file:// / ftp:// / custom schemes (CWE-22). Alpaca is https-only.
+            if (parsed_target.scheme != "https"
+                    or parsed_target.hostname not in ("paper-api.alpaca.markets", "data.alpaca.markets")):
+                self.send_error(403, "Proxy only allows Alpaca https endpoints")
                 return
             req = urllib.request.Request(target, headers={
                 "APCA-API-KEY-ID":     os.getenv("ALPACA_API_KEY", ""),

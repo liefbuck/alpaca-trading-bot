@@ -29,13 +29,23 @@ def compute_bracket_prices(price: float, qty: int) -> tuple:
     Each leg is held at least 1 cent away from the base price so Alpaca never
     rejects the order for TP <= base or SL >= base (which could happen on a
     very low-priced / high-qty fill where the raw offset rounds to $0.00).
-    Guarantees stop_price < price < take_profit_price.
+    Guarantees 0 < stop_price < price < take_profit_price.
     """
     if qty <= 0:
         qty = 1
     tp_offset = max(0.01, round(PER_POSITION_TARGET / qty, 2))
     sl_offset = max(0.01, round(-PER_POSITION_STOP / qty, 2))  # PER_POSITION_STOP is negative
-    return round(price + tp_offset, 2), round(price - sl_offset, 2)
+    take_profit_price = round(price + tp_offset, 2)
+    stop_price        = round(price - sl_offset, 2)
+    # A degenerate low-price / low-qty combo (e.g. a sub-$20 stock sized to 1 share)
+    # drives the raw stop to zero or negative, which Alpaca rejects. Not reachable
+    # for the S&P/Nasdaq universe (position_size scales qty UP for cheap names, and
+    # qty=1 only happens at price >= ~$2000 where the stop stays well positive), but
+    # floor it strictly between $0 and price so a config/universe change can never
+    # produce an invalid stop and silently kill an entry.
+    if stop_price <= 0:
+        stop_price = round(price / 2, 2) or round(price / 2, 4)
+    return take_profit_price, stop_price
 
 
 def select_stop_pl(pl: float, current_step: float, steps=None):

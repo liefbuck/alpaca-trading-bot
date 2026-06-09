@@ -55,7 +55,7 @@ _last_market_closed_log: float = 0.0   # epoch seconds — rate-limits "market c
 def save_state(data: dict):
     # Write to a temp file then replace atomically — prevents corrupt state on crash/kill.
     tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, STATE_FILE)
 
@@ -63,7 +63,7 @@ def save_state(data: dict):
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE) as f:
+            with open(STATE_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             log.warning(f"State file unreadable ({e}) — starting fresh.")
@@ -551,7 +551,7 @@ def log_daily_performance():
     history = []
     if os.path.exists(PERF_FILE):
         try:
-            with open(PERF_FILE) as f:
+            with open(PERF_FILE, encoding="utf-8") as f:
                 history = json.load(f)
         except Exception as e:
             log.warning(f"performance_log.json unreadable ({e}) — starting fresh history.")
@@ -564,7 +564,7 @@ def log_daily_performance():
 
     # Atomic write — prevents corrupt file if process is killed mid-write
     tmp = PERF_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
     os.replace(tmp, PERF_FILE)
 

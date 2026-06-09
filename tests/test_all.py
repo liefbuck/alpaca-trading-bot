@@ -57,9 +57,13 @@ class TestPositionSize(unittest.TestCase):
 
 class TestBracketPrices(unittest.TestCase):
     def test_invariant_sl_lt_price_lt_tp_across_range(self):
-        for price in [0.40, 1.00, 5.0, 12.34, 50.0, 200.0, 1500.0]:
-            for qty in [1, 5, 40, 1000, 5000]:
+        # Includes degenerate low-price/low-qty combos (e.g. $1 @ 1 share) that a
+        # hypothesis fuzz showed could drive the raw stop NEGATIVE (-$19). The stop
+        # must always be a POSITIVE price below the entry, or Alpaca rejects it.
+        for price in [0.40, 1.00, 5.0, 12.34, 50.0, 200.0, 1500.0, 2500.0]:
+            for qty in [1, 2, 5, 40, 1000, 5000]:
                 tp, sl = tm.compute_bracket_prices(price, qty)
+                self.assertGreater(sl, 0, f"SL not positive @ {price}/{qty}")   # the fuzz-found bug
                 self.assertLess(sl, price, f"SL not below price @ {price}/{qty}")
                 self.assertLess(price, tp, f"TP not above price @ {price}/{qty}")
                 # At least a 1-cent gap (allow tiny float slack).
@@ -155,6 +159,18 @@ class TestSchedulesAreEasternPinned(unittest.TestCase):
         self.assertEqual(self._et_minutes_for("daily_reset"), {(9, 29)})
         self.assertEqual(self._et_minutes_for("close_overnight"), {(9, 31)})
         self.assertEqual(self._et_minutes_for("eod_close"), {(15, 45)})
+
+    def test_daily_jobs_carry_eastern_timezone(self):
+        # Directly assert every daily .at() job stores the America/New_York tz.
+        # The next_run-based tests above can't tell at("09:29") from
+        # at("09:29", ET) on an ET machine, so this is the real guard against a
+        # tz-drop regression (which would silently fire jobs in local time).
+        daily = [j for j in self.schedule.jobs if getattr(j, "at_time", None) is not None]
+        self.assertTrue(daily, "no daily .at() jobs found — schedule wiring changed")
+        for j in daily:
+            tz = getattr(j, "at_time_zone", None)
+            self.assertIsNotNone(tz, f"daily job {j} has no tz — would fire in local time")
+            self.assertEqual(str(tz), "America/New_York", f"daily job {j} tz is {tz}, not ET")
 
 
 class TestEodWeekendGuard(unittest.TestCase):
