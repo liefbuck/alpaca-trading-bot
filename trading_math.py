@@ -38,12 +38,16 @@ def compute_bracket_prices(price: float, qty: int) -> tuple:
     return round(price + tp_offset, 2), round(price - sl_offset, 2)
 
 
-def select_stop_pl(pl: float, current_step: float, steps=STOP_STEPS):
+def select_stop_pl(pl: float, current_step: float, steps=None):
     """
     Highest stepped-stop level earned by unrealized P&L `pl` that is strictly
     above `current_step` (the level already locked in). Returns the new stop_pl
     (dollars above entry) or None if no higher step is earned yet.
     """
+    # Default to the configured ladder. Bound at call time (not as a default arg)
+    # to avoid the mutable-default-argument gotcha.
+    if steps is None:
+        steps = STOP_STEPS
     for trigger, stop_pl in sorted(steps, reverse=True):
         if pl >= trigger and stop_pl > current_step:
             return stop_pl
