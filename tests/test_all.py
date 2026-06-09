@@ -31,7 +31,7 @@ sys.path.insert(0, ROOT)
 ET = pytz.timezone("America/New_York")
 
 import trading_math as tm
-from config import STOP_STEPS, PER_POSITION_TARGET, PER_POSITION_STOP, MAX_POSITIONS
+from config import MAX_POSITIONS
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -134,9 +134,8 @@ class TestSchedulesAreEasternPinned(unittest.TestCase):
     """The riskiest change: jobs must fire at the right ET wall-clock minute."""
     @classmethod
     def setUpClass(cls):
-        import bot  # registers all schedule jobs at import
-        import schedule
-        cls.schedule = schedule
+        import bot  # importing bot registers all schedule jobs at import time
+        cls.schedule = bot.schedule   # the same schedule singleton the jobs are on
         cls.local_tz = dt.datetime.now().astimezone().tzinfo
 
     def _et_minutes_for(self, func_name):
@@ -163,7 +162,7 @@ class TestEodWeekendGuard(unittest.TestCase):
         import bot
         with mock.patch.object(bot, "client") as c, \
              mock.patch.object(bot, "log_daily_performance") as perf, \
-             mock.patch.object(bot, "close_all") as close_all, \
+             mock.patch.object(bot, "close_all"), \
              mock.patch.object(bot, "sync_bracket_fills"), \
              mock.patch.object(bot, "persist_halted"):
             c.get_clock.return_value = _fake_clock(is_open=False)
