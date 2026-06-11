@@ -34,11 +34,30 @@ function Test-Alive($procId) {
 
 # Best-effort: find a running instance of $script by command line. May miss when
 # CommandLine is $null, so a miss is NOT proof the process is dead.
+#
+# BOUNDED: the Win32_Process enumeration is a CIM/WMI call that can hang if the
+# WMI provider wedges. A hang here used to stall the whole sweep, so a dead bot.py
+# would never be relaunched (this happened ~20 min before the open on 2026-06-11).
+# We run the query in a child job and ABANDON it if it does not return within the
+# timeout, reporting "not found" so the caller relaunches instead of blocking
+# forever. Relaunching always wins over a wedged discovery query.
 function Find-RunningPid($script) {
-    $hits = @(Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-              Where-Object { $_.ExecutablePath -eq $py -and $_.CommandLine -like "*$script*" })
-    if ($hits.Count -ge 1) { return $hits[0].ProcessId }
-    return $null
+    $job = Start-Job -ScriptBlock {
+        param($pyPath, $scriptName)
+        $hits = @(Get-CimInstance Win32_Process -Filter "name='python.exe'" |
+                  Where-Object { $_.ExecutablePath -eq $pyPath -and $_.CommandLine -like "*$scriptName*" })
+        if ($hits.Count -ge 1) { $hits[0].ProcessId } else { $null }
+    } -ArgumentList $py, $script
+    $finished = Wait-Job $job -Timeout 15
+    if (-not $finished) {
+        Write-Log "Find-RunningPid($script): CIM query timed out (15s) - abandoning, will relaunch"
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    $result = Receive-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    return $result
 }
 
 # Singleton guard: never let two watchdogs manage the bots at once (e.g. a
@@ -54,7 +73,7 @@ function Test-WatchdogAlive($procId) {
     # false-positive on PID reuse and make this fresh watchdog wrongly exit,
     # potentially leaving the bot unsupervised. Fail safe (toward running): if the
     # command line can't be read, treat it as NOT a live watchdog.
-    try { $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop } catch { return $false }
+    try { $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -OperationTimeoutSec 10 -ErrorAction Stop } catch { return $false }
     if (-not $p) { return $false }
     return ($p.Name -match 'powershell|pwsh') -and ($p.CommandLine -like '*watchdog.ps1*')
 }
@@ -107,5 +126,10 @@ while ($true) {
     } catch {
         Write-Log "WATCHDOG ERROR (continuing): $($_.Exception.Message)"
     }
+    # Heartbeat: a completed sweep stamps this file. An external monitor (or a
+    # future session) can detect a wedged watchdog by a stale stamp. Because the
+    # CIM discovery above is now bounded, a sweep can no longer block indefinitely,
+    # so this stamp advances every ~60s while the watchdog is healthy.
+    Set-Content -Path (Join-Path $baseDir ".watchdog.heartbeat") -Value (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 60
 }

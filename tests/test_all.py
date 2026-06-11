@@ -531,14 +531,97 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
                 return self._fake_buy(req.symbol)
             return self._fake_oco(req.symbol)
 
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
             c.get_order_by_id.side_effect = lambda oid: mock.MagicMock(
                 status=mock.MagicMock(value="rejected"), filled_qty="0", filled_avg_price=None)
+            # Realistic flat case: get_open_position raises when there is no position,
+            # so the recheck confirms flat (not a recovered fill).
+            c.get_open_position.side_effect = RuntimeError("position does not exist")
             bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
         self.assertEqual(bought, [])
         c.cancel_order_by_id.assert_called_once()
         c.close_position.assert_called_once_with("S0")   # flatten any partial
+
+    def test_timed_out_buy_that_actually_filled_is_protected(self):
+        # The 06/11 orphan bug: _wait_for_fill times out, we cancel, but the order
+        # FILLED in the race (status 'canceled' WITH a real filled_avg_price). It
+        # must be RECOVERED and PROTECTED + tracked, never left a bare orphan.
+        import bot
+        from alpaca.trading.enums import OrderSide
+        captured = {}
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                return self._fake_buy(req.symbol)
+            captured[req.symbol] = (float(req.take_profit.limit_price),
+                                    float(req.stop_loss.stop_price))
+            return self._fake_oco(req.symbol)
+
+        # 'canceled' makes _wait_for_fill return (None, None) immediately; the SAME
+        # order then exposes a real fill on the recheck.
+        order = mock.MagicMock(status=mock.MagicMock(value="canceled"),
+                               filled_qty="10", filled_avg_price="100.0")
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.submit_order.side_effect = submit
+            c.get_order_by_id.side_effect = lambda oid: order
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, ["S0"])              # tracked, not orphaned
+        self.assertEqual(set(sl_ids), {"S0"})         # protective stop captured
+        c.cancel_order_by_id.assert_called_once()     # we still tried the cancel
+        c.close_position.assert_not_called()          # must NOT flatten a real fill
+        self.assertIn("S0", captured)                 # OCO straddles the fill
+        self.assertGreater(captured["S0"][0], 100.0)
+        self.assertLess(captured["S0"][1], 100.0)
+
+    def test_timed_out_buy_recovered_via_open_position(self):
+        # Order recheck shows no fill fields, but a live position exists -> protect
+        # it off the position's avg_entry_price, do not flatten it.
+        import bot
+        from alpaca.trading.enums import OrderSide
+        captured = {}
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                return self._fake_buy(req.symbol)
+            captured[req.symbol] = True
+            return self._fake_oco(req.symbol)
+
+        order = mock.MagicMock(status=mock.MagicMock(value="canceled"),
+                               filled_qty="0", filled_avg_price=None)
+        position = mock.MagicMock(qty="10", avg_entry_price="100.0")
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.submit_order.side_effect = submit
+            c.get_order_by_id.side_effect = lambda oid: order
+            c.get_open_position.side_effect = lambda sym: position
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, ["S0"])
+        self.assertEqual(set(sl_ids), {"S0"})
+        c.close_position.assert_not_called()          # a real position is protected, not dumped
+        self.assertIn("S0", captured)
+
+    def test_timed_out_buy_truly_flat_is_flattened_and_advanced(self):
+        # No fill on the order AND no position -> genuinely flat: flatten any partial
+        # and advance, exactly as before (the recheck must not change this path).
+        import bot
+        from alpaca.trading.enums import OrderSide
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                return self._fake_buy(req.symbol)
+            return self._fake_oco(req.symbol)
+
+        order = mock.MagicMock(status=mock.MagicMock(value="canceled"),
+                               filled_qty="0", filled_avg_price=None)
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.submit_order.side_effect = submit
+            c.get_order_by_id.side_effect = lambda oid: order
+            c.get_open_position.side_effect = RuntimeError("position does not exist")
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, [])
+        self.assertEqual(sl_ids, {})
+        c.cancel_order_by_id.assert_called_once()
+        c.close_position.assert_called_once_with("S0")
 
     def test_caps_at_max_positions(self):
         import bot
@@ -655,6 +738,16 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn("Get-PidFile", src)      # pid-file tracking
         self.assertIn("Get-Process -Id", src)  # reliable liveness check
         self.assertIn(".watchdog.lock", src)   # singleton guard (no two watchdogs)
+
+    def test_watchdog_cim_query_is_bounded(self):
+        # A hung WMI/CIM query must never block the relaunch path. On 2026-06-11 a
+        # wedged Win32_Process enumeration in Find-RunningPid stalled the sweep and
+        # left a dead bot un-relaunched ~20 min before the open. The discovery query
+        # must now run bounded (a child job abandoned after a timeout) so the sweep
+        # can never hang -> relaunch always proceeds.
+        src = self._read("watchdog.ps1")
+        self.assertIn("Wait-Job", src)
+        self.assertIn("-Timeout", src)
 
     def test_watchdog_path_independent(self):
         # The watchdog must derive its dir from its own location, not a hardcoded
