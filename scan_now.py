@@ -42,7 +42,7 @@ print("  and are force-closed at EOD, but are NOT written to bot_state.json, so 
 print("  running bot will NOT ladder their trailing stops or log them per-trade.\n")
 
 
-def _wait_for_fill(order_id, timeout=8.0, poll=0.3):
+def _wait_for_fill(order_id, timeout=15.0, poll=0.3):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -55,6 +55,28 @@ def _wait_for_fill(order_id, timeout=8.0, poll=0.3):
         if status in ("canceled", "rejected", "expired"):
             return None, None
         time.sleep(poll)
+    return None, None
+
+
+def _recheck_fill(order_id, symbol, settle=1.0):
+    """After a timeout+cancel, confirm whether the buy ACTUALLY filled (the cancel
+    can race a late fill -> 'canceled' WITH a real fill, or a live position). Mirrors
+    bot.py so this manual tool never leaves an unprotected orphan position either."""
+    time.sleep(settle)
+    try:
+        o = client.get_order_by_id(order_id)
+        if o.filled_avg_price and float(o.filled_qty or 0) > 0:
+            return float(o.filled_qty), float(o.filled_avg_price)
+    except Exception:
+        pass
+    try:
+        pos = client.get_open_position(symbol)
+        q = float(getattr(pos, "qty", 0) or 0)
+        p = float(getattr(pos, "avg_entry_price", 0) or 0)
+        if q > 0 and p > 0:
+            return q, p
+    except Exception:
+        pass
     return None, None
 
 
@@ -75,10 +97,17 @@ for stock in picks:
         continue
     fill_qty, fill_price = _wait_for_fill(buy.id)
     if not fill_price:
-        print(f"  FAILED {stock['symbol']}: buy did not fill — cancelling")
+        # Timed out: cancel, then RE-CHECK -- the cancel can race a late fill, which
+        # would otherwise leave an unprotected orphan. Recover it instead of dropping.
         try: client.cancel_order_by_id(buy.id)
         except Exception: pass
-        continue
+        fill_qty, fill_price = _recheck_fill(buy.id, stock["symbol"])
+        if not fill_price:
+            print(f"  FAILED {stock['symbol']}: buy did not fill (confirmed flat) — skipping")
+            try: client.close_position(stock["symbol"])
+            except Exception: pass
+            continue
+        print(f"  RECOVERED {stock['symbol']}: filled despite timeout — protecting it")
     take_profit_price, stop_price = compute_bracket_prices(fill_price, fill_qty)
     try:
         client.submit_order(LimitOrderRequest(
