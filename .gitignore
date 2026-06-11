@@ -12,3 +12,5 @@ install_boot_task.log
 .watchdog.lock
 .watchdog_*.pid
 .watchdog.heartbeat
+watchdog.log
+_archived/*.log
