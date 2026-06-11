@@ -203,20 +203,39 @@ class TestEodWeekendGuard(unittest.TestCase):
             close_all.assert_called_once()
 
     def test_clock_failure_closes_but_skips_summary(self):
-        # A clock-check blip must still force-close (safety) but must NOT write a
-        # performance row (we can't confirm it's a trading day -> no spurious entry).
+        # A clock-check that fails EVERY retry must still force-close (safety) but
+        # must NOT write a performance row (can't confirm a trading day).
         import bot
         with mock.patch.object(bot, "client") as c, \
              mock.patch.object(bot, "log_daily_performance") as perf, \
              mock.patch.object(bot, "close_all") as close_all, \
              mock.patch.object(bot, "sync_bracket_fills"), \
-             mock.patch.object(bot, "persist_halted"):
+             mock.patch.object(bot, "persist_halted"), \
+             mock.patch.object(bot.time, "sleep"):   # don't actually wait through retries
             c.get_clock.side_effect = RuntimeError("network")
             c.get_all_positions.return_value = []
             bot.trading_active = True
             bot.eod_close()
             close_all.assert_called_once()
             perf.assert_not_called()
+
+    def test_eod_retries_transient_clock_failure_then_writes(self):
+        # The recurring 15:45 DNS-blip bug: a TRANSIENT clock failure must be retried,
+        # and once it recovers the day's perf row IS written (not lost).
+        import bot
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "log_daily_performance") as perf, \
+             mock.patch.object(bot, "close_all") as close_all, \
+             mock.patch.object(bot, "sync_bracket_fills"), \
+             mock.patch.object(bot, "persist_halted"), \
+             mock.patch.object(bot.time, "sleep"):
+            c.get_clock.side_effect = [RuntimeError("dns"), RuntimeError("dns"),
+                                       _fake_clock(is_open=True)]
+            c.get_all_positions.return_value = []
+            bot.trading_active = True
+            bot.eod_close()
+            perf.assert_called_once()       # recovered -> summary written, NOT skipped
+            close_all.assert_called_once()
 
 
 class TestDailyPnlBaseline(unittest.TestCase):
@@ -307,6 +326,21 @@ class TestDailyResetWeekendGuard(unittest.TestCase):
             c.get_clock.return_value = _fake_clock(is_open=False, next_open=future)
             bot.daily_reset()
             reset.assert_not_called()
+
+    def test_retries_transient_clock_failure_then_resets(self):
+        # A transient DNS blip at 09:29 must NOT skip the reset (which would leave
+        # entries_done=True and the bot sitting out the day). Retry, then reset.
+        import bot
+        today = dt.datetime.now(ET)
+        clk = _fake_clock(is_open=True, next_open=today, next_close=today)
+        with mock.patch.object(bot, "client") as c, \
+             mock.patch.object(bot, "reset_session") as reset, \
+             mock.patch.object(bot, "save_state"), \
+             mock.patch.object(bot, "load_state", return_value={}), \
+             mock.patch.object(bot.time, "sleep"):
+            c.get_clock.side_effect = [RuntimeError("dns"), clk]
+            bot.daily_reset()
+            reset.assert_called_once()   # recovered -> reset ran, not skipped
 
 
 class TestStateRoundtrip(unittest.TestCase):

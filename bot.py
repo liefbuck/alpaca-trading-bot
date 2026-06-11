@@ -612,23 +612,32 @@ def log_daily_performance():
 def eod_close():
     global trading_active
     # This fires every calendar day, but the market is only open on trading days.
-    # At 15:45 ET a normal session is still open (closes 16:00), so is_open
-    # cleanly identifies trading days. On weekends/holidays, skip the whole EOD
-    # routine so we don't append an empty entry to performance_log.json.
+    # At 15:45 ET a normal session is still open (closes 16:00), so is_open cleanly
+    # identifies trading days. RETRY the clock check: a transient DNS blip recurs on
+    # this host at ~15:45:00 (06/05, 06/10, 06/11 all failed identically), and a
+    # single attempt lost the day's perf row AND skipped the safety close. DNS
+    # recovers within ~60s, so retry for a couple of minutes before giving up.
+    clock = None
+    for attempt in range(8):
+        try:
+            clock = client.get_clock()
+            break
+        except Exception as e:
+            log.warning(f"EOD: clock check failed (attempt {attempt + 1}/8) — retrying in 15s: {e}")
+            time.sleep(15)
     market_confirmed_open = False
-    try:
-        if not client.get_clock().is_open:
+    if clock is not None:
+        if not clock.is_open:
             log.info("EOD: non-trading day (weekend/holiday) — skipping summary.")
             persist_halted(False)
             trading_active = False
             return
         market_confirmed_open = True
-    except Exception as e:
-        # Can't confirm whether today is a trading day. Still close positions for
-        # safety (never leave them carried overnight), but DON'T write a
-        # performance row — on a weekend/holiday blip that would append a spurious
-        # 0-trade "WIN" for a non-trading day.
-        log.warning(f"EOD: clock check failed ({e}) — closing for safety, skipping summary.")
+    else:
+        # Still unreachable after retries. Close positions for safety (never carry
+        # overnight), but DON'T write a performance row — a weekend/holiday blip
+        # would append a spurious 0-trade "WIN" for a non-trading day.
+        log.warning("EOD: clock unreachable after retries — closing for safety, skipping summary.")
 
     log.info("EOD: Force-closing all positions.")
     # Catch any bracket orders that fired in the last few seconds before EOD.
@@ -654,10 +663,19 @@ def eod_close():
 def daily_reset():
     """Reset state at the start of each trading day."""
     global trading_active
-    try:
-        clock = client.get_clock()
-    except Exception as e:
-        log.error(f"daily_reset: could not reach Alpaca ({e}) — skipping reset.")
+    # RETRY the clock check: the same transient DNS blip that hits eod_close (see
+    # there) could land at 09:29 and skip the reset, leaving entries_done=True from
+    # yesterday so the bot never enters that day. DNS recovers within ~60s.
+    clock = None
+    for attempt in range(8):
+        try:
+            clock = client.get_clock()
+            break
+        except Exception as e:
+            log.warning(f"daily_reset: clock check failed (attempt {attempt + 1}/8) — retrying in 15s: {e}")
+            time.sleep(15)
+    if clock is None:
+        log.error("daily_reset: could not reach Alpaca after retries — skipping reset.")
         return
     # Guard: skip weekends/holidays by checking next open is today
     now = datetime.now(ET)
