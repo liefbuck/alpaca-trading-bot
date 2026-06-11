@@ -65,7 +65,9 @@ async function apca(url) {
 async function getTodayOrders() {
   const today = new Date(); today.setHours(0,0,0,0);
   try {
-    const orders = await apca(`${TRADE_URL}/orders?status=all&after=${today.toISOString()}&limit=100&direction=desc`);
+    // limit=500 (Alpaca max): on a heavy-backfill day a 100 cap could drop early
+    // fills, leaving a sell unmatched and its P&L wrong. 500 covers any real day.
+    const orders = await apca(`${TRADE_URL}/orders?status=all&after=${today.toISOString()}&limit=500&direction=desc`);
     // Count any order that ACTUALLY transacted shares, not just status==='filled'.
     // A market buy can come back status='canceled' WITH a real filled_qty when the
     // cancel races a late fill (the orphan case). Excluding it dropped the buy leg,

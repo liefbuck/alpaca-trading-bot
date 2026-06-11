@@ -408,12 +408,29 @@ def record_trade(symbol: str, pl: float):
 
 
 
-def close_all():
-    try:
-        client.close_all_positions(cancel_orders=True)
-        log.info("All positions closed.")
-    except Exception as e:
-        log.error(f"Error closing all positions: {e}")
+def close_all(max_attempts: int = 5):
+    """Close ALL positions and VERIFY flat, retrying on transient failure.
+
+    A single close that hits a network blip (e.g. the recurring 15:45 DNS one)
+    would leave positions carried overnight with EXPIRED day-OCOs — i.e. an
+    unprotected overnight gap. Never carry overnight: retry the close until a
+    position fetch confirms flat. Returns True if confirmed flat."""
+    for attempt in range(max_attempts):
+        try:
+            client.close_all_positions(cancel_orders=True)
+        except Exception as e:
+            log.warning(f"close_all attempt {attempt + 1}/{max_attempts}: {e}")
+        try:
+            remaining = client.get_all_positions()
+        except Exception:
+            remaining = None  # couldn't verify this attempt
+        if remaining is not None and len(remaining) == 0:
+            log.info("All positions closed (verified flat).")
+            return True
+        if attempt < max_attempts - 1:
+            time.sleep(5)  # let the close propagate / let a transient blip clear
+    log.error("close_all: could not confirm flat after retries — positions may remain.")
+    return False
 
 
 def step_trailing_stops(positions=None):
@@ -702,7 +719,10 @@ def close_overnight():
     try:
         positions = client.get_all_positions()
     except Exception as e:
-        log.error(f"close_overnight: could not fetch positions ({e})")
+        # Couldn't list them, but a blip here must NOT mean we skip the close and let
+        # stale positions block today's entry. Force a (verified) close anyway.
+        log.warning(f"close_overnight: could not list positions ({e}) — forcing close anyway.")
+        close_all()
         return
     if not positions:
         return

@@ -238,6 +238,42 @@ class TestEodWeekendGuard(unittest.TestCase):
             close_all.assert_called_once()
 
 
+class TestCloseAllRobust(unittest.TestCase):
+    def test_retries_until_verified_flat(self):
+        # A blip during the close must not leave positions carried overnight: keep
+        # closing until a position fetch confirms flat.
+        import bot
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            # first verify: still 1 open; second verify: flat
+            c.get_all_positions.side_effect = [[mock.MagicMock(symbol="X")], []]
+            self.assertTrue(bot.close_all())
+            self.assertEqual(c.close_all_positions.call_count, 2)   # retried once
+
+    def test_gives_up_after_max_attempts(self):
+        # Never blocks forever: bounded retries, returns False if still not flat.
+        import bot
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.get_all_positions.return_value = [mock.MagicMock(symbol="X")]  # never flat
+            self.assertFalse(bot.close_all())
+            self.assertEqual(c.close_all_positions.call_count, 5)
+
+    def test_flat_on_first_try_no_wasted_retries(self):
+        import bot
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.get_all_positions.return_value = []   # already flat
+            self.assertTrue(bot.close_all())
+            self.assertEqual(c.close_all_positions.call_count, 1)
+
+    def test_close_overnight_forces_close_even_if_listing_fails(self):
+        # A blip listing positions at 09:30 must NOT skip the close and let stale
+        # positions silently block today's entry.
+        import bot
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot, "close_all") as ca:
+            c.get_all_positions.side_effect = RuntimeError("dns")
+            bot.close_overnight()
+            ca.assert_called_once()
+
+
 class TestDailyPnlBaseline(unittest.TestCase):
     def test_missing_baseline_uses_current_equity_not_last(self):
         # No baseline -> P&L 0 (current equity), NOT a huge loss vs yesterday's
