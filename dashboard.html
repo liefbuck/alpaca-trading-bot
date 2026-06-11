@@ -66,7 +66,11 @@ async function getTodayOrders() {
   const today = new Date(); today.setHours(0,0,0,0);
   try {
     const orders = await apca(`${TRADE_URL}/orders?status=all&after=${today.toISOString()}&limit=100&direction=desc`);
-    return orders.filter(o => o.status === "filled" || o.status === "partially_filled");
+    // Count any order that ACTUALLY transacted shares, not just status==='filled'.
+    // A market buy can come back status='canceled' WITH a real filled_qty when the
+    // cancel races a late fill (the orphan case). Excluding it dropped the buy leg,
+    // so the matching sell showed $0 P&L (MRVL, 06/11). filled_qty>0 is the truth.
+    return orders.filter(o => parseFloat(o.filled_qty) > 0 && o.filled_avg_price != null);
   } catch { return []; }
 }
 
