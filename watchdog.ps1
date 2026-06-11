@@ -60,37 +60,44 @@ function Find-RunningPid($script) {
     return $result
 }
 
-# Singleton guard: never let two watchdogs manage the bots at once (e.g. a
-# SYSTEM at-startup instance plus a per-user logon instance after an unattended
-# reboot). The first to start owns a lock file; a later instance that finds a
-# LIVE watchdog already recorded there exits immediately. Without this, two
-# watchdogs could race on the pid files and double-spawn.
+# Singleton guard: never let two watchdogs manage the bots at once (e.g. a SYSTEM
+# at-startup instance plus a per-user logon instance after an unattended reboot).
+#
+# Implemented as an OS-ENFORCED EXCLUSIVE FILE LOCK: we open .watchdog.lock with
+# FileShare.Read (others may READ it for diagnostics, but no second WRITER can open
+# it) and HOLD the handle for the whole life of the watchdog. The OS enforces this
+# across the SYSTEM/user security boundary -- unlike the old guard, which compared
+# the rival's CommandLine via CIM. That came back $null across the boundary, so a
+# SYSTEM boot-watchdog and a user logon-watchdog BOTH ran and dueled on the account
+# (2026-06-11). The OS releases the handle automatically when the process dies, so a
+# restart re-acquires cleanly with no stale-file handling.
 $lockFile = Join-Path $baseDir ".watchdog.lock"
-function Test-WatchdogAlive($procId) {
-    if (-not $procId) { return $false }
-    # Must be a process ACTUALLY running watchdog.ps1 -- not merely some powershell
-    # that happens to have reused the dead lock PID. A bare ProcessName check would
-    # false-positive on PID reuse and make this fresh watchdog wrongly exit,
-    # potentially leaving the bot unsupervised. Fail safe (toward running): if the
-    # command line can't be read, treat it as NOT a live watchdog.
-    try { $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -OperationTimeoutSec 10 -ErrorAction Stop } catch { return $false }
-    if (-not $p) { return $false }
-    return ($p.Name -match 'powershell|pwsh') -and ($p.CommandLine -like '*watchdog.ps1*')
-}
-if (Test-Path $lockFile) {
-    $otherPid = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if ($otherPid -and ("$otherPid" -ne "$PID") -and (Test-WatchdogAlive $otherPid)) {
-        Write-Log "Another watchdog (PID $otherPid) already running - instance $PID exiting."
-        return
+$script:lockStream = $null
+for ($attempt = 1; ($attempt -le 5) -and (-not $script:lockStream); $attempt++) {
+    try {
+        $script:lockStream = [System.IO.File]::Open(
+            $lockFile,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::Read)
+    } catch {
+        # Sharing violation = another watchdog holds it (or one we just replaced has
+        # not released yet). Retry a few times to cover a kill-then-relaunch handoff.
+        Start-Sleep -Seconds 2
     }
 }
-Set-Content -Path $lockFile -Value $PID
-Start-Sleep -Milliseconds 300   # settle a near-simultaneous start race
-$owner = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-if ("$owner" -ne "$PID") {
-    Write-Log "Lost watchdog lock race to PID $owner - instance $PID exiting."
+if (-not $script:lockStream) {
+    Write-Log "Another watchdog holds the lock - instance $PID exiting."
     return
 }
+# Record our PID in the locked file for diagnostics. The stream stays OPEN (never
+# disposed) so the exclusive lock is held for the watchdog's entire lifetime.
+try {
+    $script:lockStream.SetLength(0)
+    $b = [System.Text.Encoding]::ASCII.GetBytes("$PID")
+    $script:lockStream.Write($b, 0, $b.Length)
+    $script:lockStream.Flush()
+} catch {}
 
 Write-Log "Watchdog started (hardened/pid-file/singleton)"
 

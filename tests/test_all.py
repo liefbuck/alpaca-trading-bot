@@ -749,6 +749,18 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn("Wait-Job", src)
         self.assertIn("-Timeout", src)
 
+    def test_watchdog_singleton_is_cross_context(self):
+        # The singleton MUST use an OS-enforced exclusive file lock, not a CIM
+        # CommandLine comparison. The latter reads $null across the SYSTEM/user
+        # boundary, which let a SYSTEM boot-watchdog and a user logon-watchdog both
+        # run and duel on the account (2026-06-11). OS file locks are enforced
+        # regardless of security context.
+        src = self._read("watchdog.ps1")
+        self.assertIn("[System.IO.File]::Open", src)        # exclusive handle
+        self.assertIn("FileShare]::Read", src)              # no second writer
+        # The broken CommandLine-based watchdog liveness check must not come back.
+        self.assertNotIn("Test-WatchdogAlive", src)
+
     def test_watchdog_path_independent(self):
         # The watchdog must derive its dir from its own location, not a hardcoded
         # OneDrive path (the repo was moved out of OneDrive to avoid sync corruption).
