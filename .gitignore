@@ -11,3 +11,4 @@ install_boot_task.log
 .claude/
 .watchdog.lock
 .watchdog_*.pid
+.watchdog.heartbeat

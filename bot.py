@@ -182,6 +182,37 @@ def _wait_for_fill(order_id, timeout: float = 8.0, poll: float = 0.3) -> tuple:
     return None, None
 
 
+def _recheck_fill(order_id, symbol: str, settle: float = 1.0) -> tuple:
+    """After a _wait_for_fill timeout + cancel, decide whether the buy ACTUALLY
+    filled. The cancel can race a late fill, so a market buy may report
+    status='canceled' WITH a real filled_avg_price/filled_qty — which used to be
+    dropped, leaving an unprotected, untracked orphan position (MRVL, 06/11).
+
+    Returns (qty, price) if the shares are genuinely held, else (None, None).
+    Two independent sources are checked because order-status and position
+    propagation each lag a cycle right after a fill:
+      1. the order's own fill fields (a 'canceled' order can still carry a fill);
+      2. the live open position (the surest proof shares are actually held).
+    """
+    time.sleep(settle)  # let the fill/cancel cross settle on the broker side
+    try:
+        o = client.get_order_by_id(order_id)
+        if o.filled_avg_price and float(o.filled_qty or 0) > 0:
+            return float(o.filled_qty), float(o.filled_avg_price)
+    except Exception:
+        pass
+    try:
+        pos = client.get_open_position(symbol)
+        qty   = float(getattr(pos, "qty", 0) or 0)
+        price = float(getattr(pos, "avg_entry_price", 0) or 0)
+        if qty > 0 and price > 0:
+            return qty, price
+    except Exception:
+        # get_open_position raises when there is no position — that IS the flat case.
+        pass
+    return None, None
+
+
 def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tuple:
     """Enter up to MAX_POSITIONS positions, each protected by an OCO exit.
 
@@ -230,22 +261,31 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
             log.error(f"Order failed {symbol}: {e} — advancing to next candidate")
             continue
 
-        # 2. Wait for the real fill so the exit is priced off it, not a guess.
-        fill_qty, fill_price = _wait_for_fill(buy.id)
+        # 2. Wait for the real fill so the exit is priced off it, not a guess. The
+        #    window is generous (15s) because fills lag at the volatile open — a
+        #    short timeout is what triggered the cancel/late-fill race below.
+        fill_qty, fill_price = _wait_for_fill(buy.id, timeout=15.0)
         if not fill_price:
-            log.error(f"Order failed {symbol}: buy did not fully fill in time — cancelling and advancing")
+            # Timed out. Cancel, then RE-CHECK before giving up: the cancel can race
+            # a late fill (Alpaca reports status='canceled' WITH a filled_avg_price),
+            # which used to leave an UNPROTECTED, UNTRACKED orphan (MRVL, 06/11).
             try:
                 client.cancel_order_by_id(buy.id)
             except Exception:
                 pass
-            # The buy may have PARTIALLY filled before we gave up. Flatten any stray
-            # shares so we never carry an unprotected, untracked position into the
-            # session (close_position is a harmless no-op if nothing filled).
-            try:
-                client.close_position(symbol)
-            except Exception:
-                pass
-            continue
+            fill_qty, fill_price = _recheck_fill(buy.id, symbol)
+            if not fill_price:
+                # Confirmed flat: no fill, no position. Flatten any stray partial for
+                # safety (no-op if nothing is held) and advance to the next candidate.
+                log.error(f"Order failed {symbol}: buy did not fill (confirmed flat after recheck) — advancing")
+                try:
+                    client.close_position(symbol)
+                except Exception:
+                    pass
+                continue
+            # The buy DID fill despite the timeout/cancel. Fall through and protect it
+            # below instead of orphaning it.
+            log.warning(f"{symbol}: buy filled despite timeout/cancel ({int(fill_qty)}x @ ${fill_price:.2f}) — attaching protection on the recovered position")
 
         # 3. Attach an OCO exit computed from the ACTUAL fill price. The OCO parent
         #    is the take-profit LIMIT; the stop-loss is a child leg.
