@@ -107,21 +107,29 @@ class TestStopLadder(unittest.TestCase):
 
 
 class TestConfiguredStopLadder(unittest.TestCase):
-    """Pins the POLICY in config.STOP_STEPS (not just the algorithm): the first rung
-    must not fire on first-minute noise, and no rung may lock at/below breakeven —
-    a market-fill stop slips, so a $0 lock becomes a loss (ARM/OXM/IBKR, 2026-06-12)."""
+    """Pins the POLICY in config.STOP_STEPS (not just the algorithm). Two 06/12
+    failures shaped it: a breakeven ($0) lock turned negative on stop slippage
+    (ARM sold -$2.65), and a too-high +$10 first rung gave winners back (ARM popped
+    +$8.30 and round-tripped). So: trail EARLY, but every lock is a profit that
+    clears typical slippage, so a pop that reverses exits for a small gain."""
     def setUp(self):
         from config import STOP_STEPS, PER_POSITION_TARGET
         self.steps = STOP_STEPS
         self.target = PER_POSITION_TARGET
 
-    def test_first_rung_not_hair_trigger(self):
-        # >= $10 on a ~$2000 position is a ~0.5% move — above ordinary open noise.
-        self.assertGreaterEqual(min(t for t, _ in self.steps), 10)
+    def test_early_pop_locks_a_profit(self):
+        # The fix for both failures: a real +$5 pop MUST ratchet, and to a POSITIVE
+        # lock (so reversing exits in profit, not at breakeven-minus-slippage).
+        locked = tm.select_stop_pl(5, -1, self.steps)
+        self.assertIsNotNone(locked, "a +$5 pop must move the stop")
+        self.assertGreater(locked, 0, "the locked level must be a profit, not breakeven")
 
-    def test_no_rung_locks_at_or_below_breakeven(self):
+    def test_every_lock_clears_a_slippage_buffer(self):
+        # No lock at/below breakeven, and the first lock keeps a few $ of cushion so a
+        # market-fill stop's slippage can't flip a liquid-name exit to a loss.
         for trigger, lock in self.steps:
             self.assertGreater(lock, 0, f"rung {trigger} locks at {lock} (<= breakeven)")
+        self.assertGreaterEqual(min(l for _, l in self.steps), 2)
 
     def test_rungs_strictly_increasing_and_below_target(self):
         triggers = [t for t, _ in self.steps]
@@ -131,10 +139,6 @@ class TestConfiguredStopLadder(unittest.TestCase):
         for trigger, lock in self.steps:
             self.assertLess(lock, trigger, "lock must sit below its own trigger")
             self.assertLess(lock, self.target, "lock must sit below the take-profit target")
-
-    def test_quarter_percent_pop_no_longer_ratchets(self):
-        # The exact 06/12 failure: a +$5 (~0.25%) pop must NOT move the stop anymore.
-        self.assertIsNone(tm.select_stop_pl(5, -1, self.steps))
 
 
 class TestLogEncoding(unittest.TestCase):

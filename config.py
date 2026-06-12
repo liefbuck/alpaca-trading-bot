@@ -12,15 +12,21 @@ PER_POSITION_TARGET  = 20.0
 # entry. Each position is sized to ~$2000 notional (position_size buys int($2000/price)
 # shares), so these dollar levels are fixed PERCENT moves: +$20 target == +1.0%.
 #
-# The first rung waits for +$10 (~0.5%) instead of the old +$5 (~0.25%): a quarter-
-# percent fires inside ordinary first-minute noise on gappers, scratching winners
-# (ARM/OXM/IBKR all locked breakeven then stopped out for a small loss on 2026-06-12).
-# And no rung locks at exactly $0: a triggered stop fills at MARKET and slips below
-# its price, so a breakeven lock turns negative. Locking a few dollars above entry
-# covers typical (liquid-name) slippage; very thin names can still slip more, but
-# starting the lock in profit is strictly better than at zero.
+# Two real failures shaped this ladder, both on 2026-06-12:
+#   * The ORIGINAL [(5,0),(10,5),(15,10)] locked the first rung at exactly breakeven.
+#     A triggered stop fills at MARKET and slips below its price, so the breakeven
+#     lock turned negative — ARM sold for -$2.65. The fix for THAT was never to delay
+#     the trigger; it was to lock a PROFIT big enough to clear slippage.
+#   * Over-correcting to a +$10 first rung then gave winners back: ARM popped to +$8.30
+#     and round-tripped to a loss because nothing locked below +$10.
+# So: keep an EARLY trigger (so a real +$5–8 pop locks something) but make every lock
+# a profit that covers typical (liquid-name) stop slippage (~$2–3). Now a pop that
+# reverses exits for a small GAIN instead of giving it all back or scratching a loss.
+# (Very thin names can still slip past a $3 buffer — that's an IEX/market-order issue,
+# not the ladder's; see the SIP-feed / marketable-limit note in the open-feed memory.)
 STOP_STEPS = [
-    (10, 3),   # up $10 (~0.5%)  → lock +$3  (above entry, absorbs typical slippage)
-    (15, 8),   # up $15 (~0.75%) → lock +$8
-    (18, 13),  # up $18 (~0.9%)  → lock +$13
+    (5,  3),   # up $5  → lock +$3   (early; the lock clears typical slippage)
+    (8,  5),   # up $8  → lock +$5
+    (12, 9),   # up $12 → lock +$9
+    (16, 13),  # up $16 → lock +$13
 ]
