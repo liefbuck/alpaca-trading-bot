@@ -941,6 +941,141 @@ class TestSyncBracketFillsRecording(unittest.TestCase):
         self.assertEqual(store["positions"], [])
 
 
+class TestPositionLifecycle(unittest.TestCase):
+    """Full trade lifecycles, the way the live runs exercised them: a buy that runs
+    up and ratchets its trailing stop into PROFIT (and sells there), and a buy that
+    fades to its stop and sells at a LOSS. Drives the REAL step_trailing_stops (the
+    ratchet) + sync_bracket_fills (the close/record) against the live config ladder,
+    so these cases no longer need a manual market run to verify. Expectations derive
+    from config.STOP_STEPS, so a ladder retune won't silently break them."""
+    SL = "00000000-0000-0000-0000-000000000001"   # a valid UUID for replace_order_by_id
+
+    def _state_backed(self, store):
+        import copy
+        def load(): return copy.deepcopy(store)
+        def save(d): store.clear(); store.update(copy.deepcopy(d))
+        return load, save
+
+    def _pos(self, symbol, pl, qty=10, entry=100.0):
+        p = mock.MagicMock()
+        p.symbol = symbol
+        p.unrealized_pl = str(pl); p.qty = str(qty); p.avg_entry_price = str(entry)
+        return p
+
+    def _order(self, side, price, qty=10):
+        import datetime as dt, pytz
+        o = mock.MagicMock()
+        o.side = mock.MagicMock(value=side)
+        o.filled_avg_price = str(price); o.filled_qty = str(qty)
+        o.submitted_at = dt.datetime.now(pytz.timezone("America/New_York"))
+        return o
+
+    def _ratchet(self, store, pos):
+        import bot
+        load, save = self._state_backed(store)
+        with mock.patch.object(bot, "load_state", side_effect=load), \
+             mock.patch.object(bot, "save_state", side_effect=save):
+            bot.step_trailing_stops(positions=[pos])
+
+    def _close(self, c, store, buy_px, sell_px, qty=10):
+        import bot
+        load, save = self._state_backed(store)
+        c.get_orders.return_value = [self._order("buy", buy_px, qty),
+                                     self._order("sell", sell_px, qty)]
+        with mock.patch.object(bot, "load_state", side_effect=load), \
+             mock.patch.object(bot, "save_state", side_effect=save):
+            bot.sync_bracket_fills(positions=[])
+
+    def test_up_one_bracket_ratchets_stop_into_profit(self):
+        # Buy, run up just past the first rung -> the stop is moved UP to a profit lock.
+        from config import STOP_STEPS
+        import bot
+        trigger, lock = min(STOP_STEPS)                 # the first rung
+        store = {"positions": ["AAA"], "sl_order_ids": {"AAA": self.SL}, "stop_steps_reached": {}}
+        with mock.patch.object(bot, "client") as c:
+            c.replace_order_by_id.return_value = mock.MagicMock(id="new-sl-1")
+            self._ratchet(store, self._pos("AAA", trigger + 0.5, qty=10, entry=100.0))
+        c.replace_order_by_id.assert_called_once()
+        self.assertEqual(store["stop_steps_reached"]["AAA"], lock)
+        self.assertGreater(lock, 0)                     # a PROFIT lock, never breakeven
+        req = c.replace_order_by_id.call_args.args[1]
+        self.assertAlmostEqual(float(req.stop_price), 100.0 + lock / 10, places=2)  # above entry
+        self.assertEqual(store["sl_order_ids"]["AAA"], "new-sl-1")  # tracks the replacement order
+
+    def test_up_then_sells_at_the_locked_profit(self):
+        # The ARM case: a pop past the first rung locks the stop in profit; price then
+        # reverses into it and fills there for a WIN — never a breakeven-slippage loss.
+        from config import STOP_STEPS
+        import bot
+        trigger, lock = min(STOP_STEPS)
+        store = {"positions": ["AAA"], "trades_today": [],
+                 "sl_order_ids": {"AAA": self.SL}, "stop_steps_reached": {}}
+        with mock.patch.object(bot, "client") as c:
+            c.replace_order_by_id.return_value = mock.MagicMock(id="new-sl-1")
+            self._ratchet(store, self._pos("AAA", trigger + 0.5, qty=10, entry=100.0))
+            stop_px = round(100.0 + store["stop_steps_reached"]["AAA"] / 10, 2)
+            self._close(c, store, buy_px=100.0, sell_px=stop_px, qty=10)
+        self.assertEqual([t["symbol"] for t in store["trades_today"]], ["AAA"])
+        self.assertGreater(store["trades_today"][0]["pl"], 0)            # sold GREEN
+        self.assertAlmostEqual(store["trades_today"][0]["pl"], lock, places=2)
+        self.assertEqual(store["positions"], [])
+
+    def test_down_then_sells_at_a_loss_without_ratcheting(self):
+        # A buy that only falls never reaches a rung, so the stop is NEVER moved; it
+        # hits its initial stop and is recorded as a loss.
+        import bot
+        store = {"positions": ["AAA"], "trades_today": [],
+                 "sl_order_ids": {"AAA": self.SL}, "stop_steps_reached": {}}
+        with mock.patch.object(bot, "client") as c:
+            self._ratchet(store, self._pos("AAA", -8.0, qty=10, entry=100.0))
+            c.replace_order_by_id.assert_not_called()        # no ratchet on a loser
+            self.assertEqual(store["stop_steps_reached"], {})
+            self._close(c, store, buy_px=100.0, sell_px=98.0, qty=10)
+        self.assertLess(store["trades_today"][0]["pl"], 0)   # sold RED
+        self.assertAlmostEqual(store["trades_today"][0]["pl"], -20.0, places=2)
+        self.assertEqual(store["positions"], [])
+
+    def test_big_jump_skips_straight_to_highest_earned_lock(self):
+        # One large move locks the TOP rung in a single ratchet, not one move per rung.
+        from config import STOP_STEPS
+        import bot
+        top_trigger, top_lock = max(STOP_STEPS)
+        store = {"positions": ["AAA"], "sl_order_ids": {"AAA": self.SL}, "stop_steps_reached": {}}
+        with mock.patch.object(bot, "client") as c:
+            c.replace_order_by_id.return_value = mock.MagicMock(id="new-sl-1")
+            self._ratchet(store, self._pos("AAA", top_trigger + 1, qty=10, entry=100.0))
+        c.replace_order_by_id.assert_called_once()
+        self.assertEqual(store["stop_steps_reached"]["AAA"], top_lock)
+
+    def test_ratchets_rung_by_rung_never_down_no_double_apply(self):
+        # Walk up: first rung moves the stop once; re-seeing the same level is a no-op;
+        # a higher rung moves it UP again. The stop never steps down or re-fires.
+        from config import STOP_STEPS
+        import bot
+        triggers = sorted(t for t, _ in STOP_STEPS)
+        store = {"positions": ["AAA"], "sl_order_ids": {"AAA": self.SL}, "stop_steps_reached": {}}
+        with mock.patch.object(bot, "client") as c:
+            # replacement id must be a valid UUID — the NEXT ratchet re-parses it.
+            c.replace_order_by_id.side_effect = (
+                lambda *a, **k: mock.MagicMock(id="00000000-0000-0000-0000-000000000002"))
+            self._ratchet(store, self._pos("AAA", triggers[0] + 0.5, entry=100.0))   # first rung
+            first_lock = store["stop_steps_reached"]["AAA"]
+            self._ratchet(store, self._pos("AAA", triggers[0] + 0.5, entry=100.0))   # same -> no-op
+            self._ratchet(store, self._pos("AAA", triggers[-1] + 1, entry=100.0))    # top rung
+        self.assertGreater(store["stop_steps_reached"]["AAA"], first_lock)   # ratcheted UP
+        self.assertEqual(c.replace_order_by_id.call_count, 2)                # the repeat did nothing
+
+    def test_take_profit_target_records_the_full_gain(self):
+        # Price runs all the way to the +$20 take-profit leg -> recorded as the full win.
+        from config import PER_POSITION_TARGET
+        import bot
+        store = {"positions": ["AAA"], "trades_today": [], "sl_order_ids": {}}
+        with mock.patch.object(bot, "client") as c:
+            self._close(c, store, buy_px=100.0, sell_px=100.0 + PER_POSITION_TARGET / 10, qty=10)
+        self.assertAlmostEqual(store["trades_today"][0]["pl"], PER_POSITION_TARGET, places=2)
+        self.assertEqual(store["positions"], [])
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. Static guards — keep earlier fixes from silently regressing
 # ──────────────────────────────────────────────────────────────────────────────
