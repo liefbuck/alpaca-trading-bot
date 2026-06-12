@@ -544,6 +544,44 @@ class TestScreener(unittest.TestCase):
             for k in ("symbol", "price", "change_pct", "rel_vol", "vol_trend", "score"):
                 self.assertIn(k, c)
 
+    def test_download_history_recovers_throttled_tickers(self):
+        # Yahoo drops 'C' on the first pass (throttle) and returns it flat (single
+        # ticker) on the recovery pass. _download_history must retry the straggler
+        # AND normalise the flat frame so every ticker is addressable as raw[sym].
+        import screener, pandas as pd
+        idx = pd.date_range("2026-04-20", periods=5, freq="D")
+        fields = ["Open", "High", "Low", "Close", "Volume"]
+        calls = []
+        state = {"first": True}
+
+        def fake_download(tickers, **kw):
+            tickers = list(tickers)
+            calls.append(tickers)
+            got = tickers
+            if state["first"]:
+                state["first"] = False
+                got = [t for t in tickers if t != "C"]   # throttle drops C first time
+            if not got:
+                return pd.DataFrame()
+            if len(got) == 1:  # real yfinance returns a FLAT frame for one ticker
+                return pd.DataFrame(1.0, index=idx, columns=fields)
+            cols = pd.MultiIndex.from_product([got, fields])
+            return pd.DataFrame(1.0, index=idx, columns=cols)
+
+        with mock.patch.object(screener.yf, "download", side_effect=fake_download), \
+                mock.patch.object(screener.time, "sleep"):
+            raw = screener._download_history(["A", "B", "C"], "30d", chunk_size=100)
+
+        self.assertEqual(set(raw.columns.get_level_values(0)), {"A", "B", "C"})
+        self.assertEqual(list(raw["C"].columns), fields)   # flat frame normalised
+        self.assertGreaterEqual(len(calls), 2)             # straggler was retried
+
+    def test_chunks_avoids_singleton_tail(self):
+        import screener
+        chunks = screener._chunks(list(range(7)), 3)
+        self.assertTrue(all(len(c) >= 2 for c in chunks), chunks)  # no length-1 chunk
+        self.assertEqual([x for c in chunks for x in c], list(range(7)))  # nothing lost
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3b. Order placement: two-step entry (bare market buy -> OCO exit priced off the

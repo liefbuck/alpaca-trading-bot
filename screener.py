@@ -5,6 +5,7 @@ Pulls the S&P 500, S&P MidCap 400, S&P SmallCap 600 and Nasdaq 100 from Wikipedi
 batch-downloads recent price/volume data so both bots can score the full market
 instead of a fixed list.
 """
+import time
 import pandas as pd
 import yfinance as yf
 import logging
@@ -182,6 +183,65 @@ def _projected_rel_vol(vol: pd.Series) -> float:
         return vol_raw / vol_avg
 
 
+_DOWNLOAD_CHUNK = 100  # tickers per Yahoo request; one ~1500-name call gets throttled
+
+
+def _chunks(seq: list, size: int) -> list:
+    """Split `seq` into `size`-length chunks, folding a trailing single element into
+    the previous chunk so no chunk has length 1 (yfinance returns a differently
+    shaped frame for a single ticker — we normalise it below, but avoid it where we
+    can)."""
+    out = [seq[i:i + size] for i in range(0, len(seq), size)]
+    if len(out) >= 2 and len(out[-1]) == 1:
+        tail = out.pop()            # pop first: doing it inline shifts the -2 index
+        out[-1] = out[-1] + tail
+    return out
+
+
+def _download_history(tickers: list, period: str, chunk_size: int = _DOWNLOAD_CHUNK,
+                      max_passes: int = 2):
+    """Batch-download daily OHLCV for `tickers` over `period`, in chunks.
+
+    Yahoo's free endpoint throttles a single ~1500-ticker request and silently drops
+    ~1/3 of it (AMZN/TSLA/JPM included — not real delistings). Downloading in
+    `chunk_size` batches dodges that, and a second pass retries whatever didn't come
+    back. Returns a (ticker, field) MultiIndex frame (so callers can do raw[symbol]),
+    or None if nothing returned at all.
+    """
+    deduped = list(dict.fromkeys(tickers))   # preserve order, drop dupes
+    frames = []
+    have: set = set()
+    for pass_num in range(max_passes):
+        todo = [t for t in deduped if t not in have]
+        if not todo:
+            break
+        if pass_num > 0:
+            log.info(f"Retrying {len(todo)} ticker(s) Yahoo dropped on the first pass...")
+            time.sleep(1)   # brief breather before retrying the stragglers
+        for chunk in _chunks(todo, chunk_size):
+            try:
+                df = yf.download(
+                    chunk, period=period, interval="1d", group_by="ticker",
+                    auto_adjust=True, threads=True, progress=False,
+                )
+            except Exception as e:
+                log.warning(f"chunk download failed ({len(chunk)} tickers): {e}")
+                continue
+            if df is None or df.empty:
+                continue
+            # yfinance returns a FLAT frame for a single-ticker chunk; normalise to the
+            # (ticker, field) MultiIndex the callers expect.
+            if not isinstance(df.columns, pd.MultiIndex):
+                df.columns = pd.MultiIndex.from_product([[chunk[0]], df.columns])
+            frames.append(df)
+            have |= set(df.columns.get_level_values(0)) & set(chunk)
+    if not frames:
+        return None
+    combined = pd.concat(frames, axis=1)
+    # a straggler can arrive in BOTH passes; keep the first occurrence of each column.
+    return combined.loc[:, ~combined.columns.duplicated()]
+
+
 def get_top_momentum(n: int = 50) -> list:
     """
     Score each stock in the S&P 500 + Nasdaq 100 + watchlist by:
@@ -199,18 +259,9 @@ def get_top_momentum(n: int = 50) -> list:
     universe = get_universe()
     log.info(f"Downloading {len(universe)} tickers for momentum scan (30d)...")
 
-    try:
-        raw = yf.download(
-            universe,
-            period="30d",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,
-            threads=True,
-            progress=False,
-        )
-    except Exception as e:
-        log.error(f"Batch download failed: {e}")
+    raw = _download_history(universe, period="30d")
+    if raw is None:
+        log.error("Momentum scan: no price data returned from any chunk.")
         return []
 
     candidates = []
@@ -276,18 +327,9 @@ def get_top_mean_reversion(n: int = 50) -> list:
     universe = get_universe()
     log.info(f"Downloading {len(universe)} tickers for mean reversion scan...")
 
-    try:
-        raw = yf.download(
-            universe,
-            period="60d",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,
-            threads=True,
-            progress=False,
-        )
-    except Exception as e:
-        log.error(f"Batch download failed: {e}")
+    raw = _download_history(universe, period="60d")
+    if raw is None:
+        log.error("Mean reversion scan: no price data returned from any chunk.")
         return []
 
     candidates = []
