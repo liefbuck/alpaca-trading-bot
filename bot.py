@@ -161,10 +161,18 @@ def scan_momentum() -> list:
 def _wait_for_fill(order_id, timeout: float = 8.0, poll: float = 0.3) -> tuple:
     """Poll a submitted order until it is fully filled.
 
-    Returns (filled_qty, filled_avg_price) once status == 'filled', or
-    (None, None) if the order is canceled/rejected/expired or the timeout
-    elapses. Market BUYs fill in well under a second; we poll so the protective
-    exit can be priced off the REAL fill rather than a pre-trade guess.
+    Returns (filled_qty, filled_avg_price, outcome) where outcome is:
+      * "filled"   — fully filled; qty/price are the REAL fill.
+      * "terminal" — the broker put the order in a terminal non-fill state
+                     (canceled/rejected/expired); re-submitting won't be helped by
+                     waiting longer.
+      * "timeout"  — the window elapsed with the order still working. At the open
+                     the IEX feed lags, so even liquid names can sit unfilled for
+                     the whole window — this is the case the caller RETRIES.
+    qty/price are None unless outcome == "filled". (A terminal 'canceled' can still
+    carry a late fill — the caller re-checks via _recheck_fill before giving up.)
+    Market BUYs normally fill in well under a second; we poll so the protective exit
+    can be priced off the REAL fill rather than a pre-trade guess.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -175,11 +183,11 @@ def _wait_for_fill(order_id, timeout: float = 8.0, poll: float = 0.3) -> tuple:
             continue
         status = getattr(o.status, "value", o.status)
         if status == "filled" and o.filled_avg_price and float(o.filled_qty or 0) > 0:
-            return float(o.filled_qty), float(o.filled_avg_price)
+            return float(o.filled_qty), float(o.filled_avg_price), "filled"
         if status in ("canceled", "rejected", "expired"):
-            return None, None
+            return None, None, "terminal"
         time.sleep(poll)
-    return None, None
+    return None, None, "timeout"
 
 
 def _recheck_fill(order_id, symbol: str, settle: float = 1.0) -> tuple:
@@ -243,10 +251,28 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
     """
     bought = []
     sl_order_ids = {}
-    for stock in candidates:
+    # Work queue of (candidate, attempt#). A market buy that merely TIMES OUT — the
+    # IEX feed routinely lags in the first minutes, so even liquid names (GOOGL/ARM,
+    # 06/12) sit unfilled for the whole 15s window — is re-queued to the BACK and
+    # retried up to MAX_FILL_ATTEMPTS. Other candidates are tried first, giving the
+    # feed time to catch up. Without this each name got ONE shot then was abandoned,
+    # draining the 10-name list and under-filling (only 2/5 on 06/12). A terminal
+    # rejection is NOT retried (waiting longer won't help), and a wall-clock budget
+    # keeps the whole cycle well short of the 10:30 entry cutoff.
+    MAX_FILL_ATTEMPTS = 3
+    ENTRY_BUDGET_S = 300
+    deadline = time.time() + ENTRY_BUDGET_S
+    queue = [(stock, 1) for stock in candidates]
+    while queue:
         if len(bought) >= MAX_POSITIONS:
             break
+        if time.time() >= deadline:
+            log.warning(f"Entry budget {ENTRY_BUDGET_S}s exhausted — {len(bought)}/{MAX_POSITIONS} filled; stopping entry.")
+            break
+        stock, attempt = queue.pop(0)
         symbol = stock["symbol"]
+        if symbol in bought:
+            continue  # already filled on an earlier pass
         qty = position_size(stock["price"], per_pos_buying_power)
 
         # 1. Bare market buy — no legs, so it cannot be rejected for leg pricing.
@@ -262,13 +288,12 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
             continue
 
         # 2. Wait for the real fill so the exit is priced off it, not a guess. The
-        #    window is generous (15s) because fills lag at the volatile open — a
-        #    short timeout is what triggered the cancel/late-fill race below.
-        fill_qty, fill_price = _wait_for_fill(buy.id, timeout=15.0)
-        if not fill_price:
-            # Timed out. Cancel, then RE-CHECK before giving up: the cancel can race
-            # a late fill (Alpaca reports status='canceled' WITH a filled_avg_price),
-            # which used to leave an UNPROTECTED, UNTRACKED orphan (MRVL, 06/11).
+        #    window is generous (15s) because fills lag at the volatile open.
+        fill_qty, fill_price, outcome = _wait_for_fill(buy.id, timeout=15.0)
+        if outcome != "filled":
+            # Cancel, then RE-CHECK before giving up: the cancel can race a late fill
+            # (Alpaca reports status='canceled' WITH a filled_avg_price), which used
+            # to leave an UNPROTECTED, UNTRACKED orphan (MRVL, 06/11).
             try:
                 client.cancel_order_by_id(buy.id)
             except Exception:
@@ -276,12 +301,18 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
             fill_qty, fill_price = _recheck_fill(buy.id, symbol)
             if not fill_price:
                 # Confirmed flat: no fill, no position. Flatten any stray partial for
-                # safety (no-op if nothing is held) and advance to the next candidate.
-                log.error(f"Order failed {symbol}: buy did not fill (confirmed flat after recheck) — advancing")
+                # safety (no-op if nothing is held).
                 try:
                     client.close_position(symbol)
                 except Exception:
                     pass
+                if outcome == "timeout" and attempt < MAX_FILL_ATTEMPTS and time.time() < deadline:
+                    # Transient open-feed lag — give this name another shot after the
+                    # rest of the list rather than abandoning it.
+                    log.warning(f"{symbol}: buy did not fill in 15s (attempt {attempt}/{MAX_FILL_ATTEMPTS}) — re-queued for retry")
+                    queue.append((stock, attempt + 1))
+                else:
+                    log.error(f"Order failed {symbol}: buy did not fill (confirmed flat after recheck) — advancing")
                 continue
             # The buy DID fill despite the timeout/cancel. Fall through and protect it
             # below instead of orphaning it.

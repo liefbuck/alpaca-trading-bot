@@ -693,6 +693,67 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         c.cancel_order_by_id.assert_called_once()
         c.close_position.assert_called_once_with("S0")
 
+    def test_timed_out_buy_is_retried_then_fills(self):
+        # A pure TIMEOUT (open IEX-feed lag, 06/12) must NOT abandon the name after
+        # one shot: it is re-queued and fills on a later pass once the feed catches
+        # up. Without retry the candidate list drained and the day under-filled.
+        import bot
+        calls = {"n": 0}
+
+        def fake_wait(order_id, timeout=15.0):
+            if order_id == "buy-S0":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return None, None, "timeout"   # first shot: feed not ready
+                return 10.0, 100.0, "filled"        # retry: fills
+            return 10.0, 100.0, "filled"
+
+        with mock.patch.object(bot, "client") as c, \
+                mock.patch.object(bot, "_wait_for_fill", side_effect=fake_wait), \
+                mock.patch.object(bot, "_recheck_fill", return_value=(None, None)), \
+                mock.patch.object(bot.time, "sleep"):
+            self._wire(c)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, ["S0"])       # retried, not abandoned
+        self.assertEqual(calls["n"], 2)        # took a second attempt
+        self.assertEqual(set(sl_ids), {"S0"})  # protective stop still captured
+
+    def test_timeout_retries_are_bounded(self):
+        # A name that ALWAYS times out is retried a BOUNDED number of times then
+        # abandoned — it must never loop forever or stall the entry cycle.
+        import bot
+        attempts = {"n": 0}
+
+        def fake_wait(order_id, timeout=15.0):
+            attempts["n"] += 1
+            return None, None, "timeout"
+
+        with mock.patch.object(bot, "client") as c, \
+                mock.patch.object(bot, "_wait_for_fill", side_effect=fake_wait), \
+                mock.patch.object(bot, "_recheck_fill", return_value=(None, None)), \
+                mock.patch.object(bot.time, "sleep"):
+            self._wire(c)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, [])
+        self.assertEqual(attempts["n"], 3)     # MAX_FILL_ATTEMPTS, not unbounded
+
+    def test_terminal_rejection_is_not_retried(self):
+        # A TERMINAL non-fill (rejected/canceled by the broker) is abandoned after a
+        # single attempt — unlike a timeout, waiting/retrying cannot help.
+        import bot
+
+        def fake_wait(order_id, timeout=15.0):
+            return None, None, "terminal"
+
+        with mock.patch.object(bot, "client") as c, \
+                mock.patch.object(bot, "_wait_for_fill", side_effect=fake_wait), \
+                mock.patch.object(bot, "_recheck_fill", return_value=(None, None)), \
+                mock.patch.object(bot.time, "sleep"):
+            self._wire(c)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+        self.assertEqual(bought, [])
+        c.cancel_order_by_id.assert_called_once()   # exactly one attempt, no retry
+
     def test_caps_at_max_positions(self):
         import bot
         cands = self._candidates(MAX_POSITIONS * 2)
