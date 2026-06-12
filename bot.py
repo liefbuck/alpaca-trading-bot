@@ -31,6 +31,12 @@ logging.basicConfig(
         RotatingFileHandler(
             os.path.join(BASE_DIR, "bot.log"),
             maxBytes=5_000_000, backupCount=3,
+            # Without an explicit encoding the handler uses the Windows locale
+            # (cp1252), which can't encode characters like the "→" in the STEP STOP
+            # message — logging then swallows the UnicodeEncodeError and DROPS the
+            # whole line. That silently hid every trailing-stop move from bot.log
+            # (and from step_watch.py's toast alerts, which tail this file).
+            encoding="utf-8",
         ),
         logging.StreamHandler(),
     ],

@@ -83,23 +83,73 @@ class TestBracketPrices(unittest.TestCase):
 
 
 class TestStopLadder(unittest.TestCase):
+    # Algorithm-level tests: pass an explicit ladder so they exercise select_stop_pl's
+    # logic independently of however config.STOP_STEPS happens to be tuned.
+    LADDER = [(5, 0), (10, 5), (15, 10)]
+
     def test_below_first_trigger_returns_none(self):
-        self.assertIsNone(tm.select_stop_pl(4.99, -1))
+        self.assertIsNone(tm.select_stop_pl(4.99, -1, self.LADDER))
 
     def test_first_step_breakeven(self):
-        self.assertEqual(tm.select_stop_pl(5, -1), 0)
+        self.assertEqual(tm.select_stop_pl(5, -1, self.LADDER), 0)
 
     def test_skips_to_highest_earned(self):
         # Jumped to +12 from start -> lock +5 (the $10 trigger), skipping breakeven.
-        self.assertEqual(tm.select_stop_pl(12, -1), 5)
+        self.assertEqual(tm.select_stop_pl(12, -1, self.LADDER), 5)
 
     def test_no_double_apply_same_level(self):
         # Already locked at +0; pl still only earns +0 -> nothing new.
-        self.assertIsNone(tm.select_stop_pl(5, 0))
+        self.assertIsNone(tm.select_stop_pl(5, 0, self.LADDER))
 
     def test_monotonic_progression(self):
-        self.assertEqual(tm.select_stop_pl(20, 5), 10)
-        self.assertIsNone(tm.select_stop_pl(20, 10))  # top of ladder already locked
+        self.assertEqual(tm.select_stop_pl(20, 5, self.LADDER), 10)
+        self.assertIsNone(tm.select_stop_pl(20, 10, self.LADDER))  # top already locked
+
+
+class TestConfiguredStopLadder(unittest.TestCase):
+    """Pins the POLICY in config.STOP_STEPS (not just the algorithm): the first rung
+    must not fire on first-minute noise, and no rung may lock at/below breakeven —
+    a market-fill stop slips, so a $0 lock becomes a loss (ARM/OXM/IBKR, 2026-06-12)."""
+    def setUp(self):
+        from config import STOP_STEPS, PER_POSITION_TARGET
+        self.steps = STOP_STEPS
+        self.target = PER_POSITION_TARGET
+
+    def test_first_rung_not_hair_trigger(self):
+        # >= $10 on a ~$2000 position is a ~0.5% move — above ordinary open noise.
+        self.assertGreaterEqual(min(t for t, _ in self.steps), 10)
+
+    def test_no_rung_locks_at_or_below_breakeven(self):
+        for trigger, lock in self.steps:
+            self.assertGreater(lock, 0, f"rung {trigger} locks at {lock} (<= breakeven)")
+
+    def test_rungs_strictly_increasing_and_below_target(self):
+        triggers = [t for t, _ in self.steps]
+        locks    = [l for _, l in self.steps]
+        self.assertEqual(triggers, sorted(set(triggers)), "triggers must strictly increase")
+        self.assertEqual(locks, sorted(set(locks)), "locks must strictly increase")
+        for trigger, lock in self.steps:
+            self.assertLess(lock, trigger, "lock must sit below its own trigger")
+            self.assertLess(lock, self.target, "lock must sit below the take-profit target")
+
+    def test_quarter_percent_pop_no_longer_ratchets(self):
+        # The exact 06/12 failure: a +$5 (~0.25%) pop must NOT move the stop anymore.
+        self.assertIsNone(tm.select_stop_pl(5, -1, self.steps))
+
+
+class TestLogEncoding(unittest.TestCase):
+    def test_logfile_handler_is_utf8(self):
+        # The bot.log file handler MUST be utf-8: without it Windows uses cp1252, which
+        # can't encode chars like the "→" in the STEP STOP message, so logging silently
+        # drops the whole line (every trailing-stop move went unlogged before this fix).
+        import logging
+        from logging.handlers import RotatingFileHandler
+        import bot  # configures the root logger at import
+        handlers = [h for h in logging.getLogger().handlers
+                    if isinstance(h, RotatingFileHandler)]
+        self.assertTrue(handlers, "expected bot to install a RotatingFileHandler")
+        for h in handlers:
+            self.assertEqual((h.encoding or "").lower(), "utf-8")
 
 
 class TestClassifyTrades(unittest.TestCase):
