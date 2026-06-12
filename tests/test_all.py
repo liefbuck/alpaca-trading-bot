@@ -151,6 +151,14 @@ class TestLogEncoding(unittest.TestCase):
         for h in handlers:
             self.assertEqual((h.encoding or "").lower(), "utf-8")
 
+    def test_yfinance_logger_silenced(self):
+        # yfinance logs hundreds of "possibly delisted" ERROR lines per scan when
+        # Yahoo throttles the bulk download; importing screener must mute its logger
+        # so that noise can't flood bot.log and bury real errors.
+        import logging
+        import screener  # noqa: F401  (import has the side effect under test)
+        self.assertGreaterEqual(logging.getLogger("yfinance").level, logging.CRITICAL)
+
 
 class TestClassifyTrades(unittest.TestCase):
     def test_breakeven_trade_is_win(self):

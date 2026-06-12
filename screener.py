@@ -11,6 +11,16 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# yfinance logs every ticker it can't fetch in a bulk download at ERROR level
+# ("$X: possibly delisted; no price data found" plus a giant "N Failed downloads"
+# dump) — hundreds of lines per scan when Yahoo's free endpoint throttles a
+# ~1500-ticker request. These are NOT our errors: the scan already skips any
+# symbol missing from the batch (see the `symbol not in raw.columns` guards), and
+# a genuine whole-batch failure is still caught and logged by us via the
+# try/except in get_top_momentum. Silence the library's own logger so the noise
+# stops burying real errors in bot.log.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 
 # Add any tickers you want tracked beyond the S&P 500 here.
 WATCHLIST: list[str] = [
