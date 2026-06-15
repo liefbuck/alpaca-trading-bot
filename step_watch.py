@@ -80,37 +80,62 @@ def _file_id(path):
 
 
 def main() -> None:
-    # Wait for the log to exist, then seek to the end so we only see new lines.
+    # Wait for the log to exist, then start at the end so we only see new lines.
     while not os.path.exists(LOG_FILE):
         time.sleep(POLL_SECONDS)
 
     with open(ALERT_FILE, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  step_watch started\n")
 
-    f = open(LOG_FILE, "r", encoding="utf-8", errors="replace")
-    f.seek(0, os.SEEK_END)
-    cur_id = _file_id(LOG_FILE)
+    # CRITICAL: do NOT hold bot.log open between polls. A persistent read handle
+    # blocks RotatingFileHandler's rename on Windows (PermissionError WinError 32),
+    # which silently FREEZES bot.log the moment it crosses the 5 MB cap — the bot
+    # keeps trading but every log line (and therefore every toast alert here) is
+    # dropped for the rest of the session. Instead we open/seek/read/close each
+    # poll, tracking a byte offset, so the bot can always roll the log over.
+    #
+    # Offsets are byte counts (binary mode) to stay consistent with os.path.getsize
+    # — text-mode tell() returns opaque cookies that can't be compared to a size.
+    offset  = os.path.getsize(LOG_FILE)   # start at end: skip existing content
+    cur_id  = _file_id(LOG_FILE)
+    pending = ""                          # partial trailing line carried over
 
     while True:
-        line = f.readline()
-        if not line:
-            # RotatingFileHandler renames bot.log -> bot.log.1 and creates a fresh
-            # bot.log. Detect that by the file's identity changing (robust even if
-            # the new file has already grown past the old size by the time we
-            # check) and reopen from the start so no alert line is skipped.
-            new_id = _file_id(LOG_FILE)
-            if new_id is not None and new_id != cur_id:
-                f.close()
-                f = open(LOG_FILE, "r", encoding="utf-8", errors="replace")
-                cur_id = new_id
-                continue
-            time.sleep(POLL_SECONDS)
+        time.sleep(POLL_SECONDS)
+
+        new_id = _file_id(LOG_FILE)
+        if new_id is None:
+            continue                      # file briefly absent mid-rotation
+        try:
+            size = os.path.getsize(LOG_FILE)
+        except OSError:
             continue
 
-        for needle, title in WATCH:
-            if needle in line:
-                record(line.strip(), title)
-                break
+        # Rotation detection, robust to both styles: inode change (rename + fresh
+        # file) OR the file shrinking below our offset (in-place truncate). Either
+        # way, restart reading from the top of the new/short file.
+        if new_id != cur_id or size < offset:
+            cur_id, offset, pending = new_id, 0, ""
+
+        if size <= offset:
+            continue                      # nothing new
+
+        try:
+            with open(LOG_FILE, "rb") as fh:
+                fh.seek(offset)
+                chunk  = fh.read()
+                offset = fh.tell()
+        except OSError:
+            continue
+
+        data    = pending + chunk.decode("utf-8", errors="replace")
+        lines   = data.split("\n")
+        pending = lines.pop()             # last piece has no newline yet
+        for line in lines:
+            for needle, title in WATCH:
+                if needle in line:
+                    record(line.strip(), title)
+                    break
 
 
 if __name__ == "__main__":

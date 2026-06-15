@@ -1154,6 +1154,21 @@ class TestSourceGuards(unittest.TestCase):
     def test_bot_log_rotation(self):
         self.assertIn("RotatingFileHandler", self._read("bot.py"))
 
+    def test_step_watch_does_not_hold_log_open(self):
+        # 2026-06-15: step_watch held bot.log open for reading for its entire life
+        # (a persistent `f = open(LOG_FILE, ...)`). On Windows a held read handle
+        # blocks RotatingFileHandler's rename, so the FIRST rollover (bot.log
+        # crossing the 5 MB cap, which happened for the first time this morning)
+        # failed with PermissionError WinError 32. logging swallows that error, so
+        # bot.log froze silently for the whole session — the bot kept trading with
+        # zero log output and step_watch fired zero toast alerts. The fix: tail by
+        # reopening the file each poll and tracking a byte offset, so the bot can
+        # always roll the log over. Guard against regressing to a persistent handle.
+        src = self._read("step_watch.py")
+        self.assertNotIn("f = open(LOG_FILE", src)   # no persistent handle
+        self.assertIn('open(LOG_FILE, "rb")', src)   # reopened per poll, binary
+        self.assertIn("offset", src)                 # tracks position across polls
+
     def test_requirements_are_pinned(self):
         # Every dependency must be pinned (==) so a fresh install can't pull a
         # breaking new major version. Unpinned deps are how "it worked yesterday"
