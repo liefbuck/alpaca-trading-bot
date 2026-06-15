@@ -164,43 +164,12 @@ def scan_momentum() -> list:
     return top[:MAX_POSITIONS * 2]
 
 
-def _wait_for_fill(order_id, timeout: float = 8.0, poll: float = 0.3) -> tuple:
-    """Poll a submitted order until it is fully filled.
-
-    Returns (filled_qty, filled_avg_price, outcome) where outcome is:
-      * "filled"   — fully filled; qty/price are the REAL fill.
-      * "terminal" — the broker put the order in a terminal non-fill state
-                     (canceled/rejected/expired); re-submitting won't be helped by
-                     waiting longer.
-      * "timeout"  — the window elapsed with the order still working. At the open
-                     the IEX feed lags, so even liquid names can sit unfilled for
-                     the whole window — this is the case the caller RETRIES.
-    qty/price are None unless outcome == "filled". (A terminal 'canceled' can still
-    carry a late fill — the caller re-checks via _recheck_fill before giving up.)
-    Market BUYs normally fill in well under a second; we poll so the protective exit
-    can be priced off the REAL fill rather than a pre-trade guess.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            o = client.get_order_by_id(order_id)
-        except Exception:
-            time.sleep(poll)
-            continue
-        status = getattr(o.status, "value", o.status)
-        if status == "filled" and o.filled_avg_price and float(o.filled_qty or 0) > 0:
-            return float(o.filled_qty), float(o.filled_avg_price), "filled"
-        if status in ("canceled", "rejected", "expired"):
-            return None, None, "terminal"
-        time.sleep(poll)
-    return None, None, "timeout"
-
-
 def _recheck_fill(order_id, symbol: str, settle: float = 1.0) -> tuple:
-    """After a _wait_for_fill timeout + cancel, decide whether the buy ACTUALLY
-    filled. The cancel can race a late fill, so a market buy may report
-    status='canceled' WITH a real filled_avg_price/filled_qty — which used to be
-    dropped, leaving an unprotected, untracked orphan position (MRVL, 06/11).
+    """After a buy is cancelled (it was still working when the entry budget ran
+    out, or the broker reported it terminal), decide whether it ACTUALLY filled.
+    The cancel can race a late fill, so a market buy may report status='canceled'
+    WITH a real filled_avg_price/filled_qty — which used to be dropped, leaving an
+    unprotected, untracked orphan position (MRVL, 06/11).
 
     Returns (qty, price) if the shares are genuinely held, else (None, None).
     Two independent sources are checked because order-status and position
@@ -227,7 +196,24 @@ def _recheck_fill(order_id, symbol: str, settle: float = 1.0) -> tuple:
     return None, None
 
 
-def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tuple:
+# Entry-cycle pacing (module-level so tests can shrink them). We submit bare market
+# BUYs for up to MAX_POSITIONS names at once and POLL them for fills, attaching each
+# OCO exit as its buy fills — rather than waiting on one order at a time. A market
+# DAY order fills on its own as soon as the IEX feed catches up, so a still-working
+# order is NEVER cancelled before the whole-cycle budget runs out (the 2026-06-15
+# 0/5 open: every buy was cancelled at 15s and re-submitted, so none ever lived long
+# enough to fill). The budget keeps the cycle well short of the 10:30 entry cutoff.
+ENTRY_BUDGET_S = 300.0
+# Poll every 2s, not faster: up to MAX_POSITIONS buys are polled concurrently, so at
+# 1s we'd hit ~MAX*60/min get_order calls and risk Alpaca's ~200 req/min limit during
+# a sustained lag. 2s keeps us comfortably under it; a couple seconds' latency to spot
+# a fill and attach its (server-side) OCO is immaterial.
+ENTRY_POLL_S   = 2.0
+
+
+def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
+                          budget_s: float = ENTRY_BUDGET_S,
+                          poll_s: float = ENTRY_POLL_S) -> tuple:
     """Enter up to MAX_POSITIONS positions, each protected by an OCO exit.
 
     TWO-STEP ENTRY — this is the fix for the recurring "only N of MAX filled"
@@ -248,92 +234,26 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
     PER_POSITION_TARGET / PER_POSITION_STOP because the legs are computed from the
     genuine fill, not a guess.
 
-    Backfill is preserved: any candidate that fails to fill (or whose protective
-    exit can't be attached) is cancelled/closed and we advance to the next ranked
-    name until MAX_POSITIONS fill or the list is exhausted.
+    Backfill is preserved: a candidate whose buy is rejected at submit, fills but
+    can't be protected, or is terminally cancelled by the broker is dropped and we
+    advance to the next ranked name until MAX_POSITIONS fill or the list runs out.
 
     Returns (bought_symbols, sl_order_ids) where sl_order_ids[symbol] is the STOP
     leg id so step_trailing_stops can ratchet it later.
     """
     bought = []
     sl_order_ids = {}
-    # Work queue of (candidate, attempt#). A market buy that merely TIMES OUT — the
-    # IEX feed routinely lags in the first minutes, so even liquid names (GOOGL/ARM,
-    # 06/12) sit unfilled for the whole 15s window — is re-queued to the BACK and
-    # retried up to MAX_FILL_ATTEMPTS. Other candidates are tried first, giving the
-    # feed time to catch up. Without this each name got ONE shot then was abandoned,
-    # draining the 10-name list and under-filling (only 2/5 on 06/12). A terminal
-    # rejection is NOT retried (waiting longer won't help), and a wall-clock budget
-    # keeps the whole cycle well short of the 10:30 entry cutoff.
-    MAX_FILL_ATTEMPTS = 3
-    ENTRY_BUDGET_S = 300
-    # Per-order fill wait before we cancel and re-queue. A market DAY buy fills as
-    # soon as the IEX feed catches up, and _wait_for_fill returns the instant it
-    # does — so a longer window only helps. 15s was too tight: on 2026-06-15 the
-    # open feed lagged for minutes, every buy was canceled at 15s and re-submitted,
-    # so no order ever lived long enough to fill (0/5, budget exhausted). NOTE: this
-    # widens the window but does not fully cure a multi-minute open lag — the real
-    # fix is to stop cancelling a still-working market order and poll it instead.
-    BUY_FILL_TIMEOUT_S = 45.0
-    deadline = time.time() + ENTRY_BUDGET_S
-    queue = [(stock, 1) for stock in candidates]
-    while queue:
-        if len(bought) >= MAX_POSITIONS:
-            break
-        if time.time() >= deadline:
-            log.warning(f"Entry budget {ENTRY_BUDGET_S}s exhausted — {len(bought)}/{MAX_POSITIONS} filled; stopping entry.")
-            break
-        stock, attempt = queue.pop(0)
-        symbol = stock["symbol"]
-        if symbol in bought:
-            continue  # already filled on an earlier pass
-        qty = position_size(stock["price"], per_pos_buying_power)
+    pending = {}              # working buy order_id -> (symbol, stock)
+    next_idx = 0              # index of the next candidate to submit
+    deadline = time.time() + budget_s
 
-        # 1. Bare market buy — no legs, so it cannot be rejected for leg pricing.
-        try:
-            buy = client.submit_order(MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            ))
-        except Exception as e:
-            log.error(f"Order failed {symbol}: {e} — advancing to next candidate")
-            continue
-
-        # 2. Wait for the real fill so the exit is priced off it, not a guess. The
-        #    window is generous because fills lag at the volatile open.
-        fill_qty, fill_price, outcome = _wait_for_fill(buy.id, timeout=BUY_FILL_TIMEOUT_S)
-        if outcome != "filled":
-            # Cancel, then RE-CHECK before giving up: the cancel can race a late fill
-            # (Alpaca reports status='canceled' WITH a filled_avg_price), which used
-            # to leave an UNPROTECTED, UNTRACKED orphan (MRVL, 06/11).
-            try:
-                client.cancel_order_by_id(buy.id)
-            except Exception:
-                pass
-            fill_qty, fill_price = _recheck_fill(buy.id, symbol)
-            if not fill_price:
-                # Confirmed flat: no fill, no position. Flatten any stray partial for
-                # safety (no-op if nothing is held).
-                try:
-                    client.close_position(symbol)
-                except Exception:
-                    pass
-                if outcome == "timeout" and attempt < MAX_FILL_ATTEMPTS and time.time() < deadline:
-                    # Transient open-feed lag — give this name another shot after the
-                    # rest of the list rather than abandoning it.
-                    log.warning(f"{symbol}: buy did not fill in 15s (attempt {attempt}/{MAX_FILL_ATTEMPTS}) — re-queued for retry")
-                    queue.append((stock, attempt + 1))
-                else:
-                    log.error(f"Order failed {symbol}: buy did not fill (confirmed flat after recheck) — advancing")
-                continue
-            # The buy DID fill despite the timeout/cancel. Fall through and protect it
-            # below instead of orphaning it.
-            log.warning(f"{symbol}: buy filled despite timeout/cancel ({int(fill_qty)}x @ ${fill_price:.2f}) — attaching protection on the recovered position")
-
-        # 3. Attach an OCO exit computed from the ACTUAL fill price. The OCO parent
-        #    is the take-profit LIMIT; the stop-loss is a child leg.
+    def _protect(symbol, stock, fill_qty, fill_price) -> bool:
+        """Attach an OCO exit priced off the REAL fill (TP above, SL below, so it
+        always straddles the market and can't be rejected for leg pricing) and
+        record the STOP leg id for the trailing-stop ratchet. Returns True if the
+        position is protected and tracked; False if the exit was rejected — in which
+        case we CLOSE the position rather than ever carry it unprotected, freeing the
+        slot for backfill."""
         take_profit_price, stop_price = compute_bracket_prices(fill_price, fill_qty)
         try:
             exit_order = client.submit_order(LimitOrderRequest(
@@ -347,21 +267,15 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
                 stop_loss=StopLossRequest(stop_price=stop_price),
             ))
         except Exception as e:
-            # We hold an UNPROTECTED position. Never carry one: flatten it now and
-            # advance. (OCO off a real fill is almost never rejected, but if the
-            # market gapped through our stop in the sub-second since the fill, the
-            # safe move is to close rather than sit unprotected.)
             log.error(f"Order failed {symbol}: OCO exit rejected ({e}) — closing position for safety and advancing")
             try:
                 client.close_position(symbol)
             except Exception as ce:
                 log.error(f"  {symbol}: FAILED to close unprotected position: {ce}")
-            continue
-
-        # Capture the STOP leg id so we can ratchet it later. leg.order_type is an
-        # OrderType enum; OrderType is a (str, Enum) so == matches whether the API
-        # returns the enum or a plain "stop" string. Search the parent and its legs
-        # (the stop is a leg of the OCO; the parent is the TP limit).
+            return False
+        # The STOP leg (not the TP-limit parent) is what step_trailing_stops ratchets.
+        # order_type is an OrderType enum; OrderType is a (str, Enum) so == matches
+        # whether the API hands back the enum or a plain "stop" string.
         sl_leg = next(
             (o for o in [exit_order, *(exit_order.legs or [])]
              if getattr(o, "order_type", None) in (OrderType.STOP, OrderType.STOP_LIMIT)),
@@ -373,6 +287,90 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
             log.warning(f"  {symbol}: OCO stop leg not returned — step stops disabled for this position")
         log.info(f"BUY {int(fill_qty)}x {symbol} @ ${fill_price:.2f} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
         bought.append(symbol)
+        return True
+
+    def _fill_open_slots():
+        """Submit BARE market buys (no legs -> nothing for Alpaca to reject) until
+        filled + still-working == MAX_POSITIONS, or the candidate list runs out. A
+        submit-time rejection is skipped so the next ranked name backfills its slot.
+        Capping at MAX_POSITIONS means we never overbuy even though buys work
+        concurrently."""
+        nonlocal next_idx
+        held = set(bought) | {s for s, _ in pending.values()}
+        while next_idx < len(candidates) and (len(bought) + len(pending)) < MAX_POSITIONS:
+            stock = candidates[next_idx]
+            next_idx += 1
+            symbol = stock["symbol"]
+            if symbol in held:
+                continue
+            qty = position_size(stock["price"], per_pos_buying_power)
+            try:
+                buy = client.submit_order(MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                ))
+            except Exception as e:
+                log.error(f"Order failed {symbol}: {e} — advancing to next candidate")
+                continue
+            pending[buy.id] = (symbol, stock)
+            held.add(symbol)
+
+    _fill_open_slots()
+    # Poll the working buys; protect each as it fills and backfill any slot a
+    # terminal rejection frees. A still-working order is LEFT ALONE — it fills on
+    # its own once the feed catches up — never cancelled mid-cycle.
+    while pending and len(bought) < MAX_POSITIONS and time.time() < deadline:
+        time.sleep(poll_s)
+        for oid, (symbol, stock) in list(pending.items()):
+            try:
+                o = client.get_order_by_id(oid)
+            except Exception:
+                continue   # transient read error — check again next poll
+            status = getattr(o.status, "value", o.status)
+            if status == "filled" and o.filled_avg_price and float(o.filled_qty or 0) > 0:
+                del pending[oid]
+                _protect(symbol, stock, float(o.filled_qty), float(o.filled_avg_price))
+            elif status in ("canceled", "rejected", "expired"):
+                # Terminal non-fill. A 'canceled' can still carry a late fill, so
+                # RECHECK before giving up (the 06/11 orphan); otherwise flatten any
+                # stray partial and let the freed slot backfill below.
+                del pending[oid]
+                fill_qty, fill_price = _recheck_fill(oid, symbol)
+                if fill_price:
+                    _protect(symbol, stock, fill_qty, fill_price)
+                else:
+                    log.warning(f"{symbol}: buy {status} without filling — advancing to next candidate")
+                    try:
+                        client.close_position(symbol)
+                    except Exception:
+                        pass
+            # else: still working — leave it; a market DAY order fills on its own.
+        _fill_open_slots()   # backfill slots freed by terminal rejections
+
+    # Budget reached (or candidates exhausted) with buys still working: cancel each
+    # straggler, then RE-CHECK for a fill that raced the cancel so we never strand an
+    # unprotected orphan. Protect a recovered fill only while we are under the cap;
+    # otherwise (or if it never filled) close it to stay flat.
+    if pending:
+        log.warning(f"Entry cycle ending with {len(pending)} buy(s) still unfilled — cancelling and reconciling.")
+    for oid, (symbol, stock) in list(pending.items()):
+        del pending[oid]
+        try:
+            client.cancel_order_by_id(oid)
+        except Exception:
+            pass
+        fill_qty, fill_price = _recheck_fill(oid, symbol)
+        if fill_price and len(bought) < MAX_POSITIONS:
+            _protect(symbol, stock, fill_qty, fill_price)
+        else:
+            try:
+                client.close_position(symbol)
+            except Exception:
+                pass
+
+    log.info(f"Entry cycle complete — {len(bought)}/{MAX_POSITIONS} filled.")
     return bought, sl_order_ids
 
 

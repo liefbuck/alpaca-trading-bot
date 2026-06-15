@@ -611,6 +611,18 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         return mock.MagicMock(status=mock.MagicMock(value="filled"),
                               filled_qty=str(qty), filled_avg_price=str(price))
 
+    def _working(self):
+        # A buy still working (accepted, not yet filled) — the open-feed-lag case.
+        return mock.MagicMock(status=mock.MagicMock(value="new"),
+                              filled_qty="0", filled_avg_price=None)
+
+    def _terminal(self, status="canceled", qty=0, price=None):
+        # A broker-terminal order. A 'canceled' may still carry a RACED fill
+        # (qty>0, price set) vs. a true no-fill (qty=0, price=None).
+        return mock.MagicMock(status=mock.MagicMock(value=status),
+                              filled_qty=str(qty),
+                              filled_avg_price=(None if price is None else str(price)))
+
     def _fake_oco(self, symbol):
         # Mirror a REAL Alpaca OCO response: the PARENT order is the take-profit
         # LIMIT; the stop-loss is a child leg whose order_type is the STOP enum
@@ -640,9 +652,9 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         # The STOP leg id (not the TP-limit parent) must be captured so
         # step_trailing_stops can ratchet it later.
         import bot
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             self._wire(c)
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000, poll_s=0.0)
         self.assertEqual(bought, ["S0"])
         self.assertEqual(sl_ids, {"S0": "sl-S0"})   # the STOP leg id, not "tp-S0"
 
@@ -660,10 +672,10 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
             captured["sl"] = float(req.stop_loss.stop_price)
             return self._fake_oco(req.symbol)
 
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
             c.get_order_by_id.side_effect = lambda oid: self._filled(qty=10, price=250.0)
-            bot._place_bracket_orders(self._candidates(1), 1_000_000)
+            bot._place_bracket_orders(self._candidates(1), 1_000_000, poll_s=0.0)
         self.assertGreater(captured["tp"], 250.0)   # take-profit above the fill
         self.assertLess(captured["sl"], 250.0)      # stop below the fill
 
@@ -671,9 +683,9 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         # Top pick's buy is rejected -> still fill MAX_POSITIONS off the spares.
         import bot
         cands = self._candidates(MAX_POSITIONS + 1)
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             self._wire(c, buy_ok=lambda s: s != "S0")
-            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000, poll_s=0.0)
         self.assertEqual(len(bought), MAX_POSITIONS)   # not short despite S0 failing
         self.assertNotIn("S0", bought)
         self.assertEqual(set(sl_ids), set(bought))     # every fill tracked its SL leg
@@ -683,16 +695,34 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         # unprotected: close it, then backfill to the next candidate.
         import bot
         cands = self._candidates(MAX_POSITIONS + 1)
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             self._wire(c, oco_ok=lambda s: s != "S0")
-            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000, poll_s=0.0)
         self.assertEqual(len(bought), MAX_POSITIONS)
         self.assertNotIn("S0", bought)
         c.close_position.assert_called_once_with("S0")   # flattened, never carried
 
-    def test_unfilled_buy_is_cancelled_and_flattened(self):
-        # A buy that never reaches 'filled' is cancelled, and any partial fill is
-        # flattened (close_position) so no unprotected/untracked shares are carried.
+    def test_slow_buy_is_not_cancelled_and_fills_on_a_later_poll(self):
+        # THE 2026-06-15 fix: a buy still WORKING on early polls must be LEFT ALONE
+        # (never cancelled + re-submitted, the churn that produced 0/5) and fills on
+        # a later poll once the feed catches up.
+        import bot
+        seq = [self._working(), self._working(), self._filled()]
+
+        def get_order(oid):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            self._wire(c)
+            c.get_order_by_id.side_effect = get_order
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000, poll_s=0.0)
+        self.assertEqual(bought, ["S0"])
+        self.assertEqual(set(sl_ids), {"S0"})
+        c.cancel_order_by_id.assert_not_called()   # a working order is never cancelled mid-cycle
+
+    def test_unfilled_buy_is_cancelled_at_budget_and_flattened(self):
+        # A buy that never fills is left working until the budget expires, then
+        # cancelled and reconciled flat — bounded by the budget, no infinite loop.
         import bot
         from alpaca.trading.enums import OrderSide
 
@@ -703,20 +733,62 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
 
         with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
-            c.get_order_by_id.side_effect = lambda oid: mock.MagicMock(
-                status=mock.MagicMock(value="rejected"), filled_qty="0", filled_avg_price=None)
-            # Realistic flat case: get_open_position raises when there is no position,
-            # so the recheck confirms flat (not a recovered fill).
+            c.get_order_by_id.side_effect = lambda oid: self._working()
             c.get_open_position.side_effect = RuntimeError("position does not exist")
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000,
+                                                       budget_s=0.0, poll_s=0.0)
         self.assertEqual(bought, [])
-        c.cancel_order_by_id.assert_called_once()
-        c.close_position.assert_called_once_with("S0")   # flatten any partial
+        c.cancel_order_by_id.assert_called_once()       # the straggler is cancelled
+        c.close_position.assert_called_once_with("S0")  # reconciled flat
 
-    def test_timed_out_buy_that_actually_filled_is_protected(self):
-        # The 06/11 orphan bug: _wait_for_fill times out, we cancel, but the order
-        # FILLED in the race (status 'canceled' WITH a real filled_avg_price). It
-        # must be RECOVERED and PROTECTED + tracked, never left a bare orphan.
+    def test_terminal_reject_is_flattened_and_not_retried(self):
+        # A broker-terminal buy never filled: flatten any stray partial and advance.
+        # The same name is NOT re-submitted (unlike a slow fill, retrying can't help).
+        import bot
+        from alpaca.trading.enums import OrderSide
+        buys = {"n": 0}
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                buys["n"] += 1
+                return self._fake_buy(req.symbol)
+            return self._fake_oco(req.symbol)
+
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.submit_order.side_effect = submit
+            c.get_order_by_id.side_effect = lambda oid: self._terminal("rejected")
+            c.get_open_position.side_effect = RuntimeError("position does not exist")
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000, poll_s=0.0)
+        self.assertEqual(bought, [])
+        self.assertEqual(buys["n"], 1)                  # submitted once, never retried
+        c.close_position.assert_called_once_with("S0")  # flatten any partial
+
+    def test_terminal_reject_during_poll_backfills_next(self):
+        # One name's buy is terminally rejected; the next ranked name still fills, so
+        # we never end the cycle a position short on a single rejection.
+        import bot
+        from alpaca.trading.enums import OrderSide
+
+        def submit(req):
+            if req.side == OrderSide.BUY:
+                return self._fake_buy(req.symbol)
+            return self._fake_oco(req.symbol)
+
+        def get_order(oid):
+            return self._terminal("rejected") if oid == "buy-S0" else self._filled()
+
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
+            c.submit_order.side_effect = submit
+            c.get_order_by_id.side_effect = get_order
+            c.get_open_position.side_effect = RuntimeError("position does not exist")
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(2), 1_000_000, poll_s=0.0)
+        self.assertEqual(bought, ["S1"])
+        self.assertNotIn("S0", bought)
+
+    def test_budget_end_recovers_raced_fill_and_protects(self):
+        # The 06/11 orphan: the budget expires with a buy still working; we cancel it
+        # but it FILLED in the race (status 'canceled' WITH a real fill). It must be
+        # RECOVERED + PROTECTED off the real fill, never left bare, never dumped.
         import bot
         from alpaca.trading.enums import OrderSide
         captured = {}
@@ -728,25 +800,22 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
                                     float(req.stop_loss.stop_price))
             return self._fake_oco(req.symbol)
 
-        # 'canceled' makes _wait_for_fill return (None, None) immediately; the SAME
-        # order then exposes a real fill on the recheck.
-        order = mock.MagicMock(status=mock.MagicMock(value="canceled"),
-                               filled_qty="10", filled_avg_price="100.0")
+        order = self._terminal("canceled", qty=10, price=100.0)   # canceled WITH a fill
         with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
             c.get_order_by_id.side_effect = lambda oid: order
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
-        self.assertEqual(bought, ["S0"])              # tracked, not orphaned
-        self.assertEqual(set(sl_ids), {"S0"})         # protective stop captured
-        c.cancel_order_by_id.assert_called_once()     # we still tried the cancel
-        c.close_position.assert_not_called()          # must NOT flatten a real fill
-        self.assertIn("S0", captured)                 # OCO straddles the fill
-        self.assertGreater(captured["S0"][0], 100.0)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000,
+                                                       budget_s=0.0, poll_s=0.0)
+        self.assertEqual(bought, ["S0"])              # recovered + tracked, not orphaned
+        self.assertEqual(set(sl_ids), {"S0"})
+        c.cancel_order_by_id.assert_called_once()
+        c.close_position.assert_not_called()          # a real fill is protected, not dumped
+        self.assertGreater(captured["S0"][0], 100.0)  # OCO straddles the fill
         self.assertLess(captured["S0"][1], 100.0)
 
-    def test_timed_out_buy_recovered_via_open_position(self):
-        # Order recheck shows no fill fields, but a live position exists -> protect
-        # it off the position's avg_entry_price, do not flatten it.
+    def test_budget_end_recovers_fill_via_open_position(self):
+        # Recheck shows no fill fields on the order, but a live position exists ->
+        # protect it off avg_entry_price, do not flatten it.
         import bot
         from alpaca.trading.enums import OrderSide
         captured = {}
@@ -757,22 +826,21 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
             captured[req.symbol] = True
             return self._fake_oco(req.symbol)
 
-        order = mock.MagicMock(status=mock.MagicMock(value="canceled"),
-                               filled_qty="0", filled_avg_price=None)
+        order = self._terminal("canceled", qty=0, price=None)
         position = mock.MagicMock(qty="10", avg_entry_price="100.0")
         with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
             c.get_order_by_id.side_effect = lambda oid: order
             c.get_open_position.side_effect = lambda sym: position
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000,
+                                                       budget_s=0.0, poll_s=0.0)
         self.assertEqual(bought, ["S0"])
         self.assertEqual(set(sl_ids), {"S0"})
         c.close_position.assert_not_called()          # a real position is protected, not dumped
         self.assertIn("S0", captured)
 
-    def test_timed_out_buy_truly_flat_is_flattened_and_advanced(self):
-        # No fill on the order AND no position -> genuinely flat: flatten any partial
-        # and advance, exactly as before (the recheck must not change this path).
+    def test_budget_end_truly_flat_is_flattened(self):
+        # No fill on the order AND no position -> genuinely flat: flatten any partial.
         import bot
         from alpaca.trading.enums import OrderSide
 
@@ -781,92 +849,33 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
                 return self._fake_buy(req.symbol)
             return self._fake_oco(req.symbol)
 
-        order = mock.MagicMock(status=mock.MagicMock(value="canceled"),
-                               filled_qty="0", filled_avg_price=None)
+        order = self._terminal("canceled", qty=0, price=None)
         with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
             c.get_order_by_id.side_effect = lambda oid: order
             c.get_open_position.side_effect = RuntimeError("position does not exist")
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000,
+                                                       budget_s=0.0, poll_s=0.0)
         self.assertEqual(bought, [])
         self.assertEqual(sl_ids, {})
         c.cancel_order_by_id.assert_called_once()
         c.close_position.assert_called_once_with("S0")
 
-    def test_timed_out_buy_is_retried_then_fills(self):
-        # A pure TIMEOUT (open IEX-feed lag, 06/12) must NOT abandon the name after
-        # one shot: it is re-queued and fills on a later pass once the feed catches
-        # up. Without retry the candidate list drained and the day under-filled.
-        import bot
-        calls = {"n": 0}
-
-        def fake_wait(order_id, timeout=15.0):
-            if order_id == "buy-S0":
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return None, None, "timeout"   # first shot: feed not ready
-                return 10.0, 100.0, "filled"        # retry: fills
-            return 10.0, 100.0, "filled"
-
-        with mock.patch.object(bot, "client") as c, \
-                mock.patch.object(bot, "_wait_for_fill", side_effect=fake_wait), \
-                mock.patch.object(bot, "_recheck_fill", return_value=(None, None)), \
-                mock.patch.object(bot.time, "sleep"):
-            self._wire(c)
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
-        self.assertEqual(bought, ["S0"])       # retried, not abandoned
-        self.assertEqual(calls["n"], 2)        # took a second attempt
-        self.assertEqual(set(sl_ids), {"S0"})  # protective stop still captured
-
-    def test_timeout_retries_are_bounded(self):
-        # A name that ALWAYS times out is retried a BOUNDED number of times then
-        # abandoned — it must never loop forever or stall the entry cycle.
-        import bot
-        attempts = {"n": 0}
-
-        def fake_wait(order_id, timeout=15.0):
-            attempts["n"] += 1
-            return None, None, "timeout"
-
-        with mock.patch.object(bot, "client") as c, \
-                mock.patch.object(bot, "_wait_for_fill", side_effect=fake_wait), \
-                mock.patch.object(bot, "_recheck_fill", return_value=(None, None)), \
-                mock.patch.object(bot.time, "sleep"):
-            self._wire(c)
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
-        self.assertEqual(bought, [])
-        self.assertEqual(attempts["n"], 3)     # MAX_FILL_ATTEMPTS, not unbounded
-
-    def test_terminal_rejection_is_not_retried(self):
-        # A TERMINAL non-fill (rejected/canceled by the broker) is abandoned after a
-        # single attempt — unlike a timeout, waiting/retrying cannot help.
-        import bot
-
-        def fake_wait(order_id, timeout=15.0):
-            return None, None, "terminal"
-
-        with mock.patch.object(bot, "client") as c, \
-                mock.patch.object(bot, "_wait_for_fill", side_effect=fake_wait), \
-                mock.patch.object(bot, "_recheck_fill", return_value=(None, None)), \
-                mock.patch.object(bot.time, "sleep"):
-            self._wire(c)
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(1), 1_000_000)
-        self.assertEqual(bought, [])
-        c.cancel_order_by_id.assert_called_once()   # exactly one attempt, no retry
-
     def test_caps_at_max_positions(self):
         import bot
         cands = self._candidates(MAX_POSITIONS * 2)
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             self._wire(c)
-            bought, _ = bot._place_bracket_orders(cands, 1_000_000)
-        self.assertEqual(len(bought), MAX_POSITIONS)   # never overbuys past the cap
+            bought, sl_ids = bot._place_bracket_orders(cands, 1_000_000, poll_s=0.0)
+        self.assertEqual(len(bought), MAX_POSITIONS)        # never overbuys past the cap
+        self.assertEqual(len(set(bought)), MAX_POSITIONS)   # and never enters a name twice
+        self.assertEqual(set(sl_ids), set(bought))          # every fill tracked its SL leg
 
     def test_all_rejected_returns_empty(self):
         import bot
-        with mock.patch.object(bot, "client") as c:
+        with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             self._wire(c, buy_ok=lambda s: False)
-            bought, sl_ids = bot._place_bracket_orders(self._candidates(3), 1_000_000)
+            bought, sl_ids = bot._place_bracket_orders(self._candidates(3), 1_000_000, poll_s=0.0)
         self.assertEqual(bought, [])
         self.assertEqual(sl_ids, {})
 
@@ -1169,20 +1178,17 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn('open(LOG_FILE, "rb")', src)   # reopened per poll, binary
         self.assertIn("offset", src)                 # tracks position across polls
 
-    def test_buy_fill_timeout_is_generous(self):
-        # 2026-06-15 open: the IEX feed lagged for minutes, so every market buy sat
-        # unfilled past the 15s wait, was canceled, and re-submitted — no order ever
-        # lived long enough to fill (0/5 filled, entry budget exhausted). The per-
-        # order fill wait must be generous, and the buy must use the named constant
-        # (not a small hardcoded literal). _wait_for_fill returns the instant the
-        # order fills, so a longer window only helps.
+    def test_entry_is_place_all_then_poll(self):
+        # 2026-06-15: the old per-order "wait 15s then cancel + re-submit" loop
+        # cancelled every buy just before it filled on a laggy open (0/5 filled).
+        # The entry path must now submit buys and POLL them, never cancelling a
+        # still-working order mid-cycle — so the obsolete per-order timeout constant
+        # and the blocking single-order wait must be gone.
         src = self._read("bot.py")
-        self.assertIn("timeout=BUY_FILL_TIMEOUT_S", src)
-        line = next((l for l in src.splitlines()
-                     if l.strip().startswith("BUY_FILL_TIMEOUT_S")), None)
-        self.assertIsNotNone(line, "BUY_FILL_TIMEOUT_S constant not found")
-        value = float(line.split("=", 1)[1].split("#")[0].strip())
-        self.assertGreaterEqual(value, 30.0)
+        self.assertIn("ENTRY_POLL_S", src)            # polls working buys
+        self.assertIn("pending", src)                 # tracks concurrent working buys
+        self.assertNotIn("BUY_FILL_TIMEOUT_S", src)   # superseded by place-all-then-poll
+        self.assertNotIn("def _wait_for_fill", src)   # per-order blocking wait removed
 
     def test_requirements_are_pinned(self):
         # Every dependency must be pinned (==) so a fresh install can't pull a
