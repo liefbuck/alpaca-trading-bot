@@ -1,7 +1,7 @@
 .env
 __pycache__/
 *.pyc
-bot.log
+bot.log*
 bot_state.json
 config.js
 # Runtime artifacts
@@ -10,7 +10,6 @@ step_alerts.log
 install_boot_task.log
 .claude/
 .watchdog.lock
-.watchdog_*.pid
 .watchdog.heartbeat
 watchdog.log
 _archived/*.log
