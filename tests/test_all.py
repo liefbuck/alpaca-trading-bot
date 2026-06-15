@@ -1169,6 +1169,21 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn('open(LOG_FILE, "rb")', src)   # reopened per poll, binary
         self.assertIn("offset", src)                 # tracks position across polls
 
+    def test_buy_fill_timeout_is_generous(self):
+        # 2026-06-15 open: the IEX feed lagged for minutes, so every market buy sat
+        # unfilled past the 15s wait, was canceled, and re-submitted — no order ever
+        # lived long enough to fill (0/5 filled, entry budget exhausted). The per-
+        # order fill wait must be generous, and the buy must use the named constant
+        # (not a small hardcoded literal). _wait_for_fill returns the instant the
+        # order fills, so a longer window only helps.
+        src = self._read("bot.py")
+        self.assertIn("timeout=BUY_FILL_TIMEOUT_S", src)
+        line = next((l for l in src.splitlines()
+                     if l.strip().startswith("BUY_FILL_TIMEOUT_S")), None)
+        self.assertIsNotNone(line, "BUY_FILL_TIMEOUT_S constant not found")
+        value = float(line.split("=", 1)[1].split("#")[0].strip())
+        self.assertGreaterEqual(value, 30.0)
+
     def test_requirements_are_pinned(self):
         # Every dependency must be pinned (==) so a fresh install can't pull a
         # breaking new major version. Unpinned deps are how "it worked yesterday"

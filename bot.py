@@ -267,6 +267,14 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
     # keeps the whole cycle well short of the 10:30 entry cutoff.
     MAX_FILL_ATTEMPTS = 3
     ENTRY_BUDGET_S = 300
+    # Per-order fill wait before we cancel and re-queue. A market DAY buy fills as
+    # soon as the IEX feed catches up, and _wait_for_fill returns the instant it
+    # does — so a longer window only helps. 15s was too tight: on 2026-06-15 the
+    # open feed lagged for minutes, every buy was canceled at 15s and re-submitted,
+    # so no order ever lived long enough to fill (0/5, budget exhausted). NOTE: this
+    # widens the window but does not fully cure a multi-minute open lag — the real
+    # fix is to stop cancelling a still-working market order and poll it instead.
+    BUY_FILL_TIMEOUT_S = 45.0
     deadline = time.time() + ENTRY_BUDGET_S
     queue = [(stock, 1) for stock in candidates]
     while queue:
@@ -294,8 +302,8 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float) -> tupl
             continue
 
         # 2. Wait for the real fill so the exit is priced off it, not a guess. The
-        #    window is generous (15s) because fills lag at the volatile open.
-        fill_qty, fill_price, outcome = _wait_for_fill(buy.id, timeout=15.0)
+        #    window is generous because fills lag at the volatile open.
+        fill_qty, fill_price, outcome = _wait_for_fill(buy.id, timeout=BUY_FILL_TIMEOUT_S)
         if outcome != "filled":
             # Cancel, then RE-CHECK before giving up: the cancel can race a late fill
             # (Alpaca reports status='canceled' WITH a filled_avg_price), which used
