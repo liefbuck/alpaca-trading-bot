@@ -41,6 +41,14 @@
     .log-label{font-size:.7rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
     .limits-row{display:flex;gap:10px;flex-wrap:wrap;font-size:.75rem;color:#8b949e;margin-top:8px}
     .limits-row span{padding:2px 10px;background:#21262d;border-radius:4px}
+    .status-strip-label{font-size:.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+    .status-line{display:flex;align-items:center;gap:11px;padding:5px 2px}
+    .status-line .st-time{font-family:monospace;font-size:.72rem;color:#8b949e;min-width:64px}
+    .status-line .st-icon{font-size:1rem;width:1.2rem;text-align:center}
+    .status-line .st-text{font-size:.92rem}
+    .status-line.recent{border-left:3px solid #58a6ff;padding-left:10px;margin-left:-2px}
+    .status-line.older{opacity:.5}
+    .status-line.older .st-text{font-size:.82rem}
     @media(max-width:600px){.log-grid{grid-template-columns:1fr}}
   </style>
 </head>
@@ -100,6 +108,11 @@ async function getPerformance() {
   catch { return []; }
 }
 
+async function getStatus() {
+  try { return (await fetch("/status").then(r => r.json())).status || []; }
+  catch { return []; }
+}
+
 const nameCache = {};
 async function getNames(symbols) {
   const missing = symbols.filter(s => !nameCache[s]);
@@ -114,13 +127,14 @@ async function getNames(symbols) {
 
 async function load() {
   try {
-    const [account, positions, orders, logs, cfg, perf] = await Promise.all([
+    const [account, positions, orders, logs, cfg, perf, statusLines] = await Promise.all([
       apca(`${TRADE_URL}/account`),
       apca(`${TRADE_URL}/positions`),
       getTodayOrders(),
       getLogs(),
       getConfig(),
       getPerformance(),
+      getStatus(),
     ]);
     const chartSymbol = positions.length ? positions[0].symbol : null;
     const allSymbols  = [...new Set([...positions.map(p => p.symbol), ...orders.map(o => o.symbol)])];
@@ -128,7 +142,7 @@ async function load() {
       chartSymbol ? getBars(chartSymbol) : Promise.resolve([]),
       getNames(allSymbols),
     ]);
-    render(account, positions, orders, bars, logs, cfg, chartSymbol, perf, names);
+    render(account, positions, orders, bars, logs, cfg, chartSymbol, perf, names, statusLines);
     document.getElementById("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
   } catch(e) {
     document.getElementById("root").innerHTML = `<div class="err">Error: ${e.message}</div>`;
@@ -138,6 +152,67 @@ async function load() {
 const fmt  = (n, d=2) => Number(n).toLocaleString("en-US", {minimumFractionDigits:d, maximumFractionDigits:d});
 const sign = n => n >= 0 ? "+" : "";
 const plColor = n => n > 0 ? "green" : n < 0 ? "red" : "muted";
+
+// Turn one raw bot.log line into a plain-English status: {time, icon, text, cls}.
+function friendlyStatus(line) {
+  const tm  = line.match(/\d{4}-\d\d-\d\d (\d\d:\d\d:\d\d)/);
+  const time = tm ? tm[1] : "";
+  const msg  = line.replace(/^.*?(INFO|WARNING|ERROR)\s+/, "");
+  let icon = "•", text = msg.slice(0, 90), cls = "muted";
+  let m;
+  if (/Trading bot started/.test(msg))                  { icon="🟢"; text="Bot started"; cls="blue"; }
+  else if (/New trading day|state reset/.test(msg))     { icon="🔄"; text="New trading day — ready"; cls="blue"; }
+  else if (/Startup catchup/.test(msg))                 { icon="⏳"; text="Catching up — checking for entries"; }
+  else if (/Momentum scan complete/.test(msg))          { m=msg.match(/(\d+) stocks/); icon="🔍"; text=`Scan complete${m?` — ${m[1]} candidates`:""}`; }
+  else if ((m=msg.match(/^BUY\s+\d+x\s+(\w+)\s+@\s+\$([\d.]+)/))) { icon="🟢"; text=`Bought ${m[1]} @ $${m[2]}`; cls="green"; }
+  else if (/Entry cycle complete/.test(msg))            { m=msg.match(/(\d+\/\d+) filled/); icon="📈"; text=`In the market — ${m?m[1]:""} filled`; cls="blue"; }
+  else if ((m=msg.match(/STEP STOP\s+(\w+)/)))          { icon="🔒"; text=`Raised stop on ${m[1]}`; cls="blue"; }
+  else if ((m=msg.match(/Bracket closed\s+(\w+):.*P&L\s+\$([+-][\d.]+)/))) {
+    const neg = m[2][0] === "-";
+    const pl  = (neg ? "-" : "+") + "$" + m[2].slice(1);
+    icon = neg ? "🔴" : "💰"; text = `Sold ${m[1]} (${pl})`; cls = neg ? "red" : "green";
+  }
+  else if (/DAILY LOSS LIMIT HIT/.test(msg))            { icon="🛑"; text="Loss limit hit — halted for the day"; cls="red"; }
+  else if (/Target already hit/.test(msg))              { icon="🎯"; text="Daily target hit — done"; cls="green"; }
+  else if (/Loss limit already hit/.test(msg))          { icon="🛑"; text="Loss limit reached — no new entries"; cls="red"; }
+  else if (/skipping momentum entry/.test(msg))         { icon="⏸️"; text="Skipped entry — market is down"; cls="yellow"; }
+  else if (/No qualifying/.test(msg))                   { icon="⏸️"; text="No qualifying setups today"; cls="yellow"; }
+  else if (/Past 10:30/.test(msg))                      { icon="⏰"; text="Entry window closed for the day"; }
+  else if (/EOD Summary/.test(msg))                     { icon="🏁"; text="Done for the day"; cls="blue"; }
+  else if (/EOD: Force-closing|EOD recording|overnight/.test(msg)) { icon="🏁"; text="Closing out positions"; }
+  else if (/All positions closed/.test(msg))            { icon="🏁"; text="Flat — all positions closed"; }
+  else if ((m=msg.match(/Order failed\s+(\w+)/)))       { icon="⚠️"; text=`Order rejected — ${m[1]}`; cls="red"; }
+  else if (/Order failed|rejected/.test(msg))           { icon="⚠️"; text="Order rejected"; cls="red"; }
+  else if (/stale position/.test(msg))                  { icon="🧹"; text="Cleared leftover positions"; }
+  else if (/Market closed/.test(msg))                   { icon="💤"; text="Market closed"; }
+  return { time, icon, text, cls };
+}
+
+// A rolling 2-line status strip: newest event on top (accented), previous below (dimmed).
+function statusStripHtml(statusLines, positions) {
+  const ev = (statusLines || []).map(friendlyStatus).filter(e => e.text);
+  const row = (e, klass) => `
+    <div class="status-line ${klass}">
+      <span class="st-time">${e.time}</span>
+      <span class="st-icon">${e.icon}</span>
+      <span class="st-text ${e.cls}">${e.text}</span>
+    </div>`;
+  let newest, older;
+  if (ev.length) {
+    newest = ev[ev.length - 1];
+    older  = ev.length > 1 ? ev[ev.length - 2] : null;
+  } else {
+    const txt = positions && positions.length ? `Holding ${positions.length} position(s)` : "Monitoring — nothing to report yet";
+    newest = { time:"", icon:"•", text:txt, cls:"muted" };
+    older  = null;
+  }
+  const blank = { time:"", icon:"·", text:"—", cls:"muted" };
+  // Returns embeddable content (no .section wrapper) — it lives at the bottom of the
+  // Account Overview box, set off by a divider.
+  return `<hr class="divider"/>
+    <div class="status-strip-label">Activity</div>
+    ${row(newest,"recent")}${row(older || blank,"older")}`;
+}
 
 function progressBar(pnl, totalRealized, cfg) {
   const { daily_target: TARGET, daily_loss_limit: LOSS_LIMIT } = cfg;
@@ -201,7 +276,7 @@ function calcRealizedPnl(orders) {
 
 let chartInstance = null;
 
-function render(account, positions, orders, bars, logs, cfg, chartSymbol, perf = [], names = {}) {
+function render(account, positions, orders, bars, logs, cfg, chartSymbol, perf = [], names = {}, statusLines = []) {
   const { daily_target: TARGET, daily_loss_limit: LOSS_LIMIT,
           per_position_stop: PER_STOP, per_position_target: PER_TARGET,
           session_baseline } = cfg;
@@ -244,6 +319,7 @@ function render(account, positions, orders, bars, logs, cfg, chartSymbol, perf =
         <div class="value">$${fmt(buyingPower)}</div>
       </div>
     </div>
+    ${statusStripHtml(statusLines, positions)}
   </div>`;
 
   // ── Open Positions ────────────────────────────────────────────────────────

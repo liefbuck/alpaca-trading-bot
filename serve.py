@@ -13,6 +13,41 @@ from config import DAILY_TARGET, DAILY_LOSS_LIMIT, PER_POSITION_STOP, MAX_POSITI
 PORT = 5000
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Lines worth surfacing on the dashboard's rolling status strip. Everything else in
+# bot.log (the 5-second "Daily P&L:" heartbeat and the per-position "  SYM P&L ..."
+# lines) is noise that would bury the real events, so the strip is built from a
+# whitelist instead of a raw tail.
+STATUS_MARKERS = (
+    "Trading bot started", "New trading day", "Startup catchup",
+    "Momentum scan complete", "BUY ", "Entry cycle complete",
+    "STEP STOP", "Bracket closed", "EOD", "All positions closed",
+    "DAILY LOSS LIMIT HIT", "Target already hit", "Loss limit already hit",
+    "skipping momentum entry", "Past 10:30", "Order failed",
+    "No qualifying", "stale position", "Market closed",
+)
+
+
+def recent_status(path, n=12, markers=STATUS_MARKERS, _chunk=800_000):
+    """Return up to the last `n` meaningful status lines from bot.log (oldest→newest).
+
+    Reads only the tail of the file (the heartbeat noise means the meaningful events
+    can be far back, so the window is generous) and keeps lines that match any marker.
+    """
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _chunk))
+            data = f.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    hits = [l.strip() for l in lines if any(m in l for m in markers)]
+    return hits[-n:]
+
+
 def tail(path, n=25, _chunk=16384):
     # Read only the last _chunk bytes instead of the whole file (bot.log can be
     # several MB and the dashboard polls /logs every 5s). 16 KB easily covers the
@@ -44,6 +79,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             data = json.dumps({
                 "momentum":      tail(os.path.join(BASE_DIR, "bot.log")),
                 "mean_reversion": tail(os.path.join(BASE_DIR, "_archived", "mean_reversion.log")),
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path == "/status":
+            data = json.dumps({
+                "status": recent_status(os.path.join(BASE_DIR, "bot.log")),
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

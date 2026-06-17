@@ -164,6 +164,90 @@ class TestLogEncoding(unittest.TestCase):
         self.assertGreaterEqual(logging.getLogger("yfinance").level, logging.CRITICAL)
 
 
+class TestMomentumLiquidityFilter(unittest.TestCase):
+    """The momentum scan must reject cheap/thin names — a -$20 market stop only holds
+    on liquid large-caps. On 2026-06-17 the four losers (all sub-$50 mid/small-caps)
+    blew through the stop to -$24..-$49; the filter requires price >= MIN_SHARE_PRICE
+    and avg daily dollar-volume >= MIN_AVG_DOLLAR_VOL."""
+
+    def _frame(self, specs):
+        # specs: {symbol: (last_price, last_volume)}. Build a 30-bar history (dates in
+        # the past so no partial-day projection) that gaps up ~0.6%, has rising volume
+        # and elevated last-bar volume, so every name passes gap/rel_vol/vol_trend and
+        # ONLY the price + dollar-volume gates decide survival.
+        import pandas as pd
+        idx = pd.date_range(end="2020-01-30", periods=30, freq="B")
+        cols, data = [], {}
+        for sym, (price, vol) in specs.items():
+            closes = [price * 0.994] * 29 + [price]          # +0.6% gap on last bar
+            vols   = [vol * 0.5] * 15 + [vol * 0.9] * 14 + [vol]  # rising + hot last bar
+            cols += [(sym, "Close"), (sym, "Volume")]
+            data[(sym, "Close")]  = closes
+            data[(sym, "Volume")] = vols
+        return pd.DataFrame(data, index=idx, columns=pd.MultiIndex.from_tuples(cols))
+
+    def test_filter_keeps_liquid_drops_cheap_and_thin(self):
+        import screener
+        specs = {
+            "LIQ":  (100.0, 1_000_000),   # $100, $100M/day  -> keep
+            "CHEAP": (45.0, 2_000_000),   # $45 (<$50), $90M/day -> drop on price
+            "THIN": (200.0,    50_000),   # $200, $10M/day (<$50M) -> drop on dollar-vol
+        }
+        frame = self._frame(specs)
+        with mock.patch.object(screener, "get_universe", return_value=list(specs)), \
+             mock.patch.object(screener, "_download_history", return_value=frame):
+            top = screener.get_top_momentum(n=50)
+        symbols = {c["symbol"] for c in top}
+        self.assertIn("LIQ", symbols)
+        self.assertNotIn("CHEAP", symbols)   # fails price floor
+        self.assertNotIn("THIN", symbols)    # fails dollar-volume floor
+
+
+class TestStatusStrip(unittest.TestCase):
+    """The dashboard's rolling status strip is built from serve.recent_status, which
+    must surface only meaningful events and drop the per-tick 'Daily P&L:' heartbeat
+    and the indented per-position lines that otherwise dominate bot.log."""
+
+    LINES = [
+        "2026-06-17 09:30:00,000 INFO Trading bot started",
+        "2026-06-17 09:31:05,000 INFO Daily P&L: $-5.00  (limit $-200 | target $200)",
+        "2026-06-17 09:31:05,001 INFO   AMKR  P&L $+2.94 [stop locked at $+3]",
+        "2026-06-17 09:34:29,000 INFO BUY 21x AMKR @ $92.63 | TP $93.58 | SL $91.68",
+        "2026-06-17 09:35:11,000 INFO Entry cycle complete — 10/10 filled.",
+        "2026-06-17 10:05:00,000 INFO Bracket closed AMKR: entry $91.56 → exit $92.00 | P&L $+9.68",
+        "2026-06-17 15:45:01,000 INFO EOD Summary: {'date': '2026-06-17'}",
+    ]
+
+    def _write(self):
+        fd, p = tempfile.mkstemp()
+        os.close(fd)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.LINES))
+        self.addCleanup(os.remove, p)
+        return p
+
+    def test_filters_noise_and_keeps_events_newest_last(self):
+        import serve
+        out = serve.recent_status(self._write(), n=12)
+        self.assertTrue(all("Daily P&L:" not in l for l in out), "heartbeat leaked")
+        self.assertTrue(all("  AMKR  P&L" not in l for l in out), "per-position line leaked")
+        self.assertTrue(any("Entry cycle complete" in l for l in out))
+        self.assertTrue(any("Bracket closed" in l for l in out))
+        self.assertTrue(out[-1].endswith("EOD Summary: {'date': '2026-06-17'}"), "must be newest-last")
+
+    def test_caps_at_n(self):
+        import serve
+        out = serve.recent_status(self._write(), n=2)
+        self.assertEqual(len(out), 2)
+        # The two most recent meaningful events.
+        self.assertIn("Bracket closed", out[0])
+        self.assertIn("EOD Summary", out[1])
+
+    def test_missing_file_returns_empty(self):
+        import serve
+        self.assertEqual(serve.recent_status("does_not_exist_xyz.log"), [])
+
+
 class TestClassifyTrades(unittest.TestCase):
     def test_breakeven_trade_is_win(self):
         c = tm.classify_trades([{"symbol": "X", "pl": 0.0}], 0.0)

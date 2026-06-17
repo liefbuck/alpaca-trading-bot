@@ -10,6 +10,8 @@ import pandas as pd
 import yfinance as yf
 import logging
 
+from config import MIN_SHARE_PRICE, MIN_AVG_DOLLAR_VOL
+
 log = logging.getLogger(__name__)
 
 # yfinance logs every ticker it can't fetch in a bulk download at ERROR level
@@ -296,25 +298,45 @@ def get_top_momentum(n: int = 50) -> list:
             change_pct = (current - prev_close) / prev_close * 100
             rel_vol    = _projected_rel_vol(vol)
 
+            # Average daily dollar-volume over completed bars (price x volume). This is
+            # the liquidity gate: a -$20 market stop only holds on names with real depth
+            # and a tight spread. Use historical bars (vol_hist) so today's partial bar
+            # doesn't deflate the estimate.
+            close_hist = df["Close"].iloc[:-1] if _last_date >= _today else df["Close"]
+            n_bars     = min(len(close_hist), len(vol_hist))
+            if n_bars > 0:
+                avg_dollar_vol = float(
+                    (close_hist.iloc[-n_bars:].values * vol_hist.iloc[-n_bars:].values).mean()
+                )
+            else:
+                avg_dollar_vol = 0.0
+
             # Score = gap% x today's relative vol x 30-day vol trend
             score = change_pct * (rel_vol ** 1.25) * vol_trend
 
             candidates.append({
-                "symbol":     symbol,
-                "price":      round(current, 2),
-                "change_pct": round(change_pct, 2),
-                "rel_vol":    round(rel_vol, 2),
-                "vol_trend":  round(vol_trend, 2),
-                "score":      round(score, 3),
+                "symbol":         symbol,
+                "price":          round(current, 2),
+                "change_pct":     round(change_pct, 2),
+                "rel_vol":        round(rel_vol, 2),
+                "vol_trend":      round(vol_trend, 2),
+                "avg_dollar_vol": round(avg_dollar_vol, 0),
+                "score":          round(score, 3),
             })
         except Exception:
             continue
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    top = [c for c in candidates if c["change_pct"] > 0.5 and c["vol_trend"] > 1.0 and c["rel_vol"] > 1.0]
+    top = [
+        c for c in candidates
+        if c["change_pct"] > 0.5 and c["vol_trend"] > 1.0 and c["rel_vol"] > 1.0
+        and c["price"] >= MIN_SHARE_PRICE
+        and c["avg_dollar_vol"] >= MIN_AVG_DOLLAR_VOL
+    ]
     log.info(
-        f"Momentum scan complete — {len(top)} stocks up >0.5% with rising 30d volume "
-        f"out of {len(candidates)} scanned"
+        f"Momentum scan complete — {len(top)} stocks up >0.5% with rising 30d volume, "
+        f"price >= ${MIN_SHARE_PRICE:.0f} and >= ${MIN_AVG_DOLLAR_VOL/1e6:.0f}M/day "
+        f"dollar-volume, out of {len(candidates)} scanned"
     )
     return top[:n]
 
