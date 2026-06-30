@@ -16,7 +16,7 @@ from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOr
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass, OrderType
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
-from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
+from trading_math import position_size, compute_bracket_prices, stop_limit_price, select_stop_pl, classify_trades
 
 load_dotenv()
 
@@ -255,6 +255,11 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
         case we CLOSE the position rather than ever carry it unprotected, freeing the
         slot for backfill."""
         take_profit_price, stop_price = compute_bracket_prices(fill_price, fill_qty)
+        # Marketable stop-LIMIT, not a bare stop-MARKET: cap how far the protective
+        # exit can slip (a -$20 market stop slipped to -$45..-$113 — the fat left tail
+        # that made a 60%+ win rate lose money). The limit sits STOP_LIMIT_SLIP below
+        # the trigger so a liquid name still fills, but never at a runaway price.
+        stop_limit = stop_limit_price(stop_price, fill_qty)
         try:
             exit_order = client.submit_order(LimitOrderRequest(
                 symbol=symbol,
@@ -264,7 +269,7 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
                 order_class=OrderClass.OCO,
                 limit_price=take_profit_price,
                 take_profit=TakeProfitRequest(limit_price=take_profit_price),
-                stop_loss=StopLossRequest(stop_price=stop_price),
+                stop_loss=StopLossRequest(stop_price=stop_price, limit_price=stop_limit),
             ))
         except Exception as e:
             log.error(f"Order failed {symbol}: OCO exit rejected ({e}) — closing position for safety and advancing")
@@ -285,7 +290,7 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
             sl_order_ids[symbol] = str(sl_leg.id)
         else:
             log.warning(f"  {symbol}: OCO stop leg not returned — step stops disabled for this position")
-        log.info(f"BUY {int(fill_qty)}x {symbol} @ ${fill_price:.2f} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
+        log.info(f"BUY {int(fill_qty)}x {symbol} @ ${fill_price:.2f} | TP ${take_profit_price} | SL ${stop_price} (lim ${stop_limit}) | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
         bought.append(symbol)
         return True
 
@@ -508,13 +513,21 @@ def step_trailing_stops(positions=None):
             continue
 
         new_stop_price = round(entry_price + new_stop_pl / qty, 2)
+        # The protective leg is a stop-LIMIT, so its limit must ratchet UP with the
+        # trigger — otherwise the limit stays at the original (lower) price and the
+        # ratcheted stop could trigger above its own limit and never fill. Keep the
+        # same STOP_LIMIT_SLIP buffer below the new trigger.
+        new_limit_price = stop_limit_price(new_stop_price, qty)
         try:
             # replace_order cancels the existing order and returns a NEW order with a
             # new ID. Capture it so the next step targets the live order, not the
             # stale (now-replaced) one.
-            new_order = client.replace_order_by_id(UUID(sl_id), ReplaceOrderRequest(stop_price=new_stop_price))
+            new_order = client.replace_order_by_id(
+                UUID(sl_id),
+                ReplaceOrderRequest(stop_price=new_stop_price, limit_price=new_limit_price),
+            )
             sl_order_ids[symbol] = str(new_order.id)
-            log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share)")
+            log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share, lim ${new_limit_price:.2f})")
             steps_reached[symbol] = new_stop_pl
             updated = True
         except Exception as e:

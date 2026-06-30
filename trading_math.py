@@ -5,21 +5,31 @@ Centralised here so bot.py and scan_now.py share ONE implementation (previously
 the bracket math was duplicated and could drift), and so the regression suite in
 tests/ can exercise every rule deterministically.
 """
-from config import PER_POSITION_TARGET, PER_POSITION_STOP, STOP_STEPS
+from config import (
+    PER_POSITION_TARGET, PER_POSITION_STOP, STOP_STEPS,
+    POSITION_NOTIONAL, STOP_LIMIT_SLIP,
+)
 
 
 def position_size(price: float, buying_power: float) -> int:
     """
     Share quantity for one position. `buying_power` is the per-position budget.
 
+    Sizes to a fixed POSITION_NOTIONAL (~$2000), capped by what the per-position
+    budget can afford. This is DELIBERATELY independent of PER_POSITION_TARGET:
+    keying the size off the target (the old int(TARGET/(price*1%))) silently scaled
+    every position with the target, so raising the target 20 -> 40 would have doubled
+    notional and risk. With POSITION_NOTIONAL=2000 this returns exactly the same share
+    counts the old target=20 formula did, but a target retune no longer moves them.
+
     Returns at least 1. Guards price <= 0 (would otherwise divide by zero) by
     returning 1 — screener candidates are always > 0, this is pure defence.
     """
     if price <= 0:
         return 1
-    shares_for_target = int(PER_POSITION_TARGET / (price * 0.01))
+    shares_for_notional = int(POSITION_NOTIONAL / price)
     max_affordable = int(buying_power / price)
-    return max(1, min(shares_for_target, max_affordable))
+    return max(1, min(shares_for_notional, max_affordable))
 
 
 def compute_bracket_prices(price: float, qty: int) -> tuple:
@@ -46,6 +56,31 @@ def compute_bracket_prices(price: float, qty: int) -> tuple:
     if stop_price <= 0:
         stop_price = round(price / 2, 2) or round(price / 2, 4)
     return take_profit_price, stop_price
+
+
+def stop_limit_price(stop_price: float, qty: int) -> float:
+    """
+    Limit price for a protective stop-LIMIT sell: STOP_LIMIT_SLIP dollars (total, across
+    the whole position) below the stop trigger.
+
+    When the stop triggers, the position sells as a LIMIT no worse than this price —
+    instead of a plain stop-MARKET that filled at whatever the violent first minutes
+    offered (a -$20 stop slipping to -$45..-$113 was the fat left tail that made a 60%+
+    win rate unprofitable). On a liquid name the fill lands at/near the trigger; the
+    limit only binds in a fast move, capping the loss near -$28 rather than letting it
+    run. If price gaps clean through the limit the order rests unfilled — the daily
+    loss-limit kill switch and the EOD force-close are the backstops for that rare case.
+
+    Floored strictly above $0 (and below the trigger) so a degenerate low-price / high-
+    qty combo can never produce a non-positive or inverted limit that Alpaca rejects.
+    """
+    if qty <= 0:
+        qty = 1
+    offset = max(0.01, round(STOP_LIMIT_SLIP / qty, 2))
+    limit = round(stop_price - offset, 2)
+    if limit <= 0:
+        limit = round(stop_price / 2, 2) or 0.01
+    return limit
 
 
 def select_stop_pl(pl: float, current_step: float, steps=None):
