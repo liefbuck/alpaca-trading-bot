@@ -15,8 +15,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass, OrderType
 from screener import get_top_momentum
-from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
-from trading_math import position_size, compute_bracket_prices, stop_limit_price, select_stop_pl, classify_trades
+from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_HARD_STOP
+from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
 
 load_dotenv()
 
@@ -255,11 +255,12 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
         case we CLOSE the position rather than ever carry it unprotected, freeing the
         slot for backfill."""
         take_profit_price, stop_price = compute_bracket_prices(fill_price, fill_qty)
-        # Marketable stop-LIMIT, not a bare stop-MARKET: cap how far the protective
-        # exit can slip (a -$20 market stop slipped to -$45..-$113 — the fat left tail
-        # that made a 60%+ win rate lose money). The limit sits STOP_LIMIT_SLIP below
-        # the trigger so a liquid name still fills, but never at a runaway price.
-        stop_limit = stop_limit_price(stop_price, fill_qty)
+        # Plain stop-MARKET (not stop-LIMIT): a market stop ALWAYS fills, so the position
+        # can't ride unprotected past its stop. A stop-LIMIT (tried 2026-06-30) caps
+        # slippage but DOESN'T fill when a volatile name gaps through its limit — ALGT/RRX
+        # stuck at -$37/-$44 with limit sells resting below the market. The liquidity floor
+        # already bounds market-stop slippage to a few $; check_pnl's hard-stop is the
+        # backstop if a server-side stop still fails to flatten.
         try:
             exit_order = client.submit_order(LimitOrderRequest(
                 symbol=symbol,
@@ -269,7 +270,7 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
                 order_class=OrderClass.OCO,
                 limit_price=take_profit_price,
                 take_profit=TakeProfitRequest(limit_price=take_profit_price),
-                stop_loss=StopLossRequest(stop_price=stop_price, limit_price=stop_limit),
+                stop_loss=StopLossRequest(stop_price=stop_price),
             ))
         except Exception as e:
             log.error(f"Order failed {symbol}: OCO exit rejected ({e}) — closing position for safety and advancing")
@@ -290,7 +291,7 @@ def _place_bracket_orders(candidates: list, per_pos_buying_power: float,
             sl_order_ids[symbol] = str(sl_leg.id)
         else:
             log.warning(f"  {symbol}: OCO stop leg not returned — step stops disabled for this position")
-        log.info(f"BUY {int(fill_qty)}x {symbol} @ ${fill_price:.2f} | TP ${take_profit_price} | SL ${stop_price} (lim ${stop_limit}) | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
+        log.info(f"BUY {int(fill_qty)}x {symbol} @ ${fill_price:.2f} | TP ${take_profit_price} | SL ${stop_price} | gap {stock['change_pct']}% | relvol {stock['rel_vol']}x | voltren {stock.get('vol_trend','?')}x")
         bought.append(symbol)
         return True
 
@@ -513,21 +514,13 @@ def step_trailing_stops(positions=None):
             continue
 
         new_stop_price = round(entry_price + new_stop_pl / qty, 2)
-        # The protective leg is a stop-LIMIT, so its limit must ratchet UP with the
-        # trigger — otherwise the limit stays at the original (lower) price and the
-        # ratcheted stop could trigger above its own limit and never fill. Keep the
-        # same STOP_LIMIT_SLIP buffer below the new trigger.
-        new_limit_price = stop_limit_price(new_stop_price, qty)
         try:
             # replace_order cancels the existing order and returns a NEW order with a
             # new ID. Capture it so the next step targets the live order, not the
             # stale (now-replaced) one.
-            new_order = client.replace_order_by_id(
-                UUID(sl_id),
-                ReplaceOrderRequest(stop_price=new_stop_price, limit_price=new_limit_price),
-            )
+            new_order = client.replace_order_by_id(UUID(sl_id), ReplaceOrderRequest(stop_price=new_stop_price))
             sl_order_ids[symbol] = str(new_order.id)
-            log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share, lim ${new_limit_price:.2f})")
+            log.info(f"STEP STOP {symbol}: P&L ${pl:+.2f} → stop raised to ${new_stop_pl:+.0f} (${new_stop_price:.2f}/share)")
             steps_reached[symbol] = new_stop_pl
             updated = True
         except Exception as e:
@@ -538,6 +531,47 @@ def step_trailing_stops(positions=None):
         state["stop_steps_reached"] = steps_reached
         state["sl_order_ids"] = sl_order_ids
         save_state(state)
+
+
+def enforce_per_position_hard_stop(positions):
+    """Safety net: market-close any held position whose unrealized P&L has fallen to
+    PER_POSITION_HARD_STOP. The protective bracket is a stop-MARKET that normally fills
+    near the -$20 stop, but a server-side stop can rarely fail to flatten — a partial
+    fill on a fast gap, or one that never triggers — leaving the position riding
+    unprotected (ALGT/RRX hit -$37/-$44 on 2026-06-30 when the stop-LIMIT experiment's
+    limit sells couldn't fill). This is broker-order-independent: it acts purely on the
+    live unrealized P&L, so an exit is guaranteed no matter what the resting order does.
+
+    Cancels the symbol's open orders first (so the now-stale OCO can't later try to sell
+    shares we no longer hold), then closes at market. sync_bracket_fills records the P&L
+    on a later cycle once the close settles. Returns the list of symbols force-closed."""
+    closed = []
+    for pos in positions:
+        try:
+            pl = float(pos.unrealized_pl)
+        except (TypeError, ValueError):
+            continue
+        if pl > PER_POSITION_HARD_STOP:
+            continue
+        symbol = pos.symbol
+        log.warning(f"HARD STOP {symbol}: P&L ${pl:+.2f} <= ${PER_POSITION_HARD_STOP:.0f} "
+                    f"— protective stop failed to flatten; force-closing at market.")
+        # Cancel this symbol's resting (stuck) sell orders, then market-close.
+        try:
+            for o in client.get_orders(GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN, symbols=[symbol], limit=20)):
+                try:
+                    client.cancel_order_by_id(o.id)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"  {symbol}: could not list/cancel resting orders ({e}) — closing anyway.")
+        try:
+            client.close_position(symbol)
+            closed.append(symbol)
+        except Exception as e:
+            log.error(f"  {symbol}: HARD STOP close failed: {e}")
+    return closed
 
 
 def sync_bracket_fills(positions=None):
@@ -628,6 +662,12 @@ def check_pnl():
 
     if positions is not None:
         sync_bracket_fills(positions)
+        # Safety net BEFORE ratcheting: if any position has blown past its stop (the
+        # broker's protective order failed to flatten), force-close it now rather than
+        # ratchet/monitor a position that should already be gone.
+        forced = enforce_per_position_hard_stop(positions)
+        if forced:
+            positions = [p for p in positions if p.symbol not in forced]
         step_trailing_stops(positions)
 
     daily_pnl = get_daily_pnl()

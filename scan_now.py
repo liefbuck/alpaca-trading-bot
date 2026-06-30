@@ -6,7 +6,7 @@ from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, TakeP
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS
-from trading_math import position_size, compute_bracket_prices, stop_limit_price
+from trading_math import position_size, compute_bracket_prices
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -109,16 +109,15 @@ for stock in picks:
             continue
         print(f"  RECOVERED {stock['symbol']}: filled despite timeout — protecting it")
     take_profit_price, stop_price = compute_bracket_prices(fill_price, fill_qty)
-    stop_limit = stop_limit_price(stop_price, fill_qty)  # marketable stop-LIMIT, caps slippage
     try:
         client.submit_order(LimitOrderRequest(
             symbol=stock["symbol"], qty=int(fill_qty), side=OrderSide.SELL,
             time_in_force=TimeInForce.DAY, order_class=OrderClass.OCO,
             limit_price=take_profit_price,
             take_profit=TakeProfitRequest(limit_price=take_profit_price),
-            stop_loss=StopLossRequest(stop_price=stop_price, limit_price=stop_limit),
+            stop_loss=StopLossRequest(stop_price=stop_price),
         ))
-        print(f"  BOUGHT {int(fill_qty)}x {stock['symbol']} @ ${fill_price:.2f}  | TP ${take_profit_price} SL ${stop_price} (lim ${stop_limit})")
+        print(f"  BOUGHT {int(fill_qty)}x {stock['symbol']} @ ${fill_price:.2f}  | TP ${take_profit_price} SL ${stop_price}")
     except Exception as e:
         print(f"  FAILED {stock['symbol']} (OCO exit rejected) — closing position: {e}")
         try: client.close_position(stock["symbol"])

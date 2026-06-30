@@ -14,21 +14,33 @@ DAILY_TARGET         = 200.0
 # equals this -200 limit exactly — so there is ~$0 cushion for stop slippage / gap-
 # throughs: the day force-halts right at theoretical max loss (user chose to keep -200
 # at 10 positions on 2026-06-16 rather than restore the old -300 cushion).
-# NOTE: as of 2026-06-30 each loss is also capped near -$28 by a marketable stop-LIMIT
-# (STOP_LIMIT_SLIP below), so the realistic worst case is bounded ABOVE the old market-
-# stop slippage that drove single losers to -$45..-$113 (06-02/05-20). This -200 limit
-# now acts as a true backstop (it trips after ~7 capped stop-outs) rather than firing
-# exactly at theoretical max.
 DAILY_LOSS_LIMIT     = -200.0
 PER_POSITION_STOP    = -20.0
 MAX_POSITIONS        = 10
 
+# Per-position HARD stop (safety net). The protective exit is a stop-MARKET order, which
+# always fills — but a server-side stop can still, rarely, fail to flatten (a partial
+# fill on a fast gap, an order that never triggers). If that happens the position rides
+# unprotected past its -$20 stop. So check_pnl independently force-closes ANY held
+# position whose unrealized P&L falls to this level, guaranteeing an exit no matter what
+# the broker order does. Set well BELOW the -$20 stop so it only fires on a genuine stop
+# FAILURE, never on a normal stop fill.
+#
+# THIS REPLACES the 2026-06-30 stop-LIMIT experiment, which backfired live the same day:
+# a stop-LIMIT caps slippage but DOESN'T FILL when a volatile name gaps through the limit
+# — ALGT and RRX rode to -$37 and -$44 (vs the -$20 stop) with their limit sells stuck
+# unfilled BELOW the market, and AVAV round-tripped +$21 -> +$0.11. On a momentum name a
+# guaranteed exit (stop-MARKET) beats a capped-but-maybe-unfilled one. Catastrophic
+# market-stop slippage (-$113, 05-20) was a THIN-name problem already fixed by the
+# liquidity floor above; on the $50+/$50M-a-day universe a market stop slips only a few $.
+PER_POSITION_HARD_STOP = -30.0
+
 # Reward:risk. THE root cause of the slow daily bleed (analysis 2026-06-30): the system
 # won 60-90% of the time yet still lost money because realized losers (-$45..-$113, from
-# market-stop slippage) dwarfed winners that were hard-capped at +$20. With losses now
-# capped near -$28 by a stop-LIMIT, the target is raised to +$40 so a winner is worth
-# ~2x a loser. A high win rate only compounds if the average win >= the average loss;
-# this restores that. +$40 on a ~$2000 position is a +2% move; -$20 is -1%.
+# thin-name market-stop slippage, now gated out by the liquidity floor) dwarfed winners
+# hard-capped at +$20. The target is raised to +$40 so a winner is worth ~2x a loser. A
+# high win rate only compounds if the average win >= the average loss; this restores it.
+# +$40 on a ~$2000 position is a +2% move; -$20 is -1%.
 PER_POSITION_TARGET  = 40.0
 
 # Position sizing is DECOUPLED from the target (was int(TARGET/(price*1%)), which would
@@ -36,18 +48,6 @@ PER_POSITION_TARGET  = 40.0
 # a fixed notional instead so the dollar target/stop stay clean percent moves regardless
 # of how the target is tuned. position_size buys int(POSITION_NOTIONAL / price) shares.
 POSITION_NOTIONAL    = 2000.0
-
-# Marketable stop-LIMIT slippage cap (dollars, whole-position). The protective stop is a
-# stop-LIMIT, not a stop-MARKET: when the stop triggers, the sell is a limit no worse
-# than STOP_LIMIT_SLIP below the trigger. A plain stop-market sold at WHATEVER the
-# violent first 5 minutes offered, turning a -$20 stop into -$45..-$113 (06-02 worst
-# -$68.53, 05-20 worst -$113.63) — that fat left tail is what made a 60%+ win rate
-# unprofitable. $8 (~0.4% of a $2000 position) is wide enough that a liquid large-cap
-# (we already gate on price + dollar-volume) fills in the normal case, but caps the loss
-# near -$28 instead of letting it run. If price gaps clean THROUGH the limit the order
-# rests unfilled — the daily loss-limit kill switch and the EOD force-close are the
-# backstops for that rare case (never an unbounded overnight gap).
-STOP_LIMIT_SLIP      = 8.0
 
 # Stepped trailing stop: list of (trigger_pl, new_stop_pl)
 # Once unrealized P&L crosses trigger, the stop order is moved to new_stop_pl above
@@ -66,8 +66,8 @@ STOP_LIMIT_SLIP      = 8.0
 # +$40 target — the old ladder topped out at +$13, which (with a +$20 target) re-capped
 # winners almost as tightly as the bug it replaced. The wider rungs let a real runner
 # keep more of a +$22/+$32 move while still locking a profit the moment it reverses.
-# The stop-LIMIT (STOP_LIMIT_SLIP) now bounds how far a triggered lock can slip, so a
-# locked rung fills close to its level instead of at whatever market offered.
+# Each lock keeps a few $ of cushion so a triggered MARKET stop's slippage can't flip a
+# locked-profit exit to a loss (the original reason locks are never set at breakeven).
 STOP_STEPS = [
     (5,  3),   # up $5  → lock +$3   (early; a small pop still ratchets to a profit)
     (12, 7),   # up $12 → lock +$7

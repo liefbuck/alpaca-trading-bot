@@ -84,50 +84,28 @@ class TestBracketPrices(unittest.TestCase):
         self.assertAlmostEqual(sl, 100.0 + PER_POSITION_STOP / 20, places=2)  # STOP is negative
 
 
-class TestStopLimitCap(unittest.TestCase):
-    """The protective stop is a marketable stop-LIMIT (added 2026-06-30): a triggered
-    exit sells no worse than STOP_LIMIT_SLIP below the trigger, capping the slippage
-    that turned -$20 market stops into -$45..-$113 losers. The limit must always be a
-    positive price strictly below its trigger, with the configured buffer."""
-
-    def test_limit_below_stop_and_positive_across_range(self):
-        from config import STOP_LIMIT_SLIP
-        for stop in [0.50, 1.00, 12.34, 99.0, 250.0, 2490.0]:
-            for qty in [1, 2, 10, 100, 5000]:
-                lim = tm.stop_limit_price(stop, qty)
-                self.assertGreater(lim, 0, f"limit not positive @ {stop}/{qty}")
-                self.assertLess(lim, stop, f"limit not below trigger @ {stop}/{qty}")
-
-    def test_buffer_matches_config(self):
-        from config import STOP_LIMIT_SLIP
-        # qty chosen so the per-share buffer is exact: $8 / 8 shares = $1/share.
-        lim = tm.stop_limit_price(100.0, int(STOP_LIMIT_SLIP))
-        self.assertAlmostEqual(lim, 100.0 - 1.0, places=2)
-
-    def test_qty_zero_does_not_crash(self):
-        lim = tm.stop_limit_price(50.0, 0)
-        self.assertGreater(lim, 0)
-        self.assertLess(lim, 50.0)
-
-
 class TestRewardRiskAsymmetry(unittest.TestCase):
     """Policy pin (2026-06-30 analysis): the daily bleed came from a 1:1 target/stop
-    whose realized losers (market-stop slippage) dwarfed its capped +$20 winners. The
-    take-profit target must now be strictly LARGER than the per-position stop, so a
-    high win rate actually compounds. Pinned so a future edit can't quietly revert it."""
+    whose realized losers (thin-name market-stop slippage, now gated by the liquidity
+    floor) dwarfed its capped +$20 winners. The take-profit target must now be strictly
+    LARGER than the per-position stop, so a high win rate actually compounds. Pinned so
+    a future edit can't quietly revert it."""
 
     def test_target_strictly_exceeds_stop(self):
         from config import PER_POSITION_TARGET, PER_POSITION_STOP
         self.assertGreater(PER_POSITION_TARGET, abs(PER_POSITION_STOP),
                            "reward must exceed risk (target > |stop|)")
 
-    def test_worst_capped_loss_smaller_than_target(self):
-        # With the stop-LIMIT, the worst intended loss is |stop| + STOP_LIMIT_SLIP. That
-        # capped loss must stay below the target, or a stopped name still beats a winner.
-        from config import PER_POSITION_TARGET, PER_POSITION_STOP, STOP_LIMIT_SLIP
-        worst_capped_loss = abs(PER_POSITION_STOP) + STOP_LIMIT_SLIP
-        self.assertLess(worst_capped_loss, PER_POSITION_TARGET,
-                        "even a fully-slipped capped loss must be smaller than a full win")
+
+class TestHardStopThreshold(unittest.TestCase):
+    """The per-position safety-net hard stop must sit BELOW the normal stop, so it only
+    fires when the protective bracket has actually FAILED to flatten (the 2026-06-30
+    stop-LIMIT non-fill that let ALGT/RRX ride to -$37/-$44), never on a normal stop."""
+
+    def test_hard_stop_is_below_the_normal_stop(self):
+        from config import PER_POSITION_HARD_STOP, PER_POSITION_STOP
+        self.assertLess(PER_POSITION_HARD_STOP, PER_POSITION_STOP,
+                        "hard stop must be more negative than the -$20 stop")
 
 
 class TestPositionNotionalSizing(unittest.TestCase):
@@ -829,9 +807,10 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
         self.assertGreater(captured["tp"], 250.0)   # take-profit above the fill
         self.assertLess(captured["sl"], 250.0)      # stop below the fill
 
-    def test_exit_stop_is_a_marketable_limit_capping_slippage(self):
-        # 2026-06-30 fix: the protective stop leg must carry a LIMIT below its trigger,
-        # so a triggered exit can't slip to a runaway market price (the -$113 tail).
+    def test_exit_stop_is_a_plain_market_stop(self):
+        # The protective stop leg must be a plain stop-MARKET (no limit_price), so a
+        # triggered exit ALWAYS fills — a stop-LIMIT (tried 2026-06-30) left ALGT/RRX
+        # stuck unfilled below their limit and riding to -$37/-$44.
         import bot
         from alpaca.trading.enums import OrderSide
         captured = {}
@@ -840,16 +819,15 @@ class TestTwoStepEntryAndBackfill(unittest.TestCase):
             if req.side == OrderSide.BUY:
                 return self._fake_buy(req.symbol)
             captured["stop"]  = float(req.stop_loss.stop_price)
-            captured["limit"] = float(req.stop_loss.limit_price)
+            captured["limit"] = getattr(req.stop_loss, "limit_price", None)
             return self._fake_oco(req.symbol)
 
         with mock.patch.object(bot, "client") as c, mock.patch.object(bot.time, "sleep"):
             c.submit_order.side_effect = submit
             c.get_order_by_id.side_effect = lambda oid: self._filled(qty=10, price=250.0)
             bot._place_bracket_orders(self._candidates(1), 1_000_000, poll_s=0.0)
-        self.assertIn("limit", captured)                     # a stop-LIMIT, not a bare stop
-        self.assertLess(captured["limit"], captured["stop"]) # limit sits below the trigger
-        self.assertGreater(captured["limit"], 0)             # and is a valid positive price
+        self.assertLess(captured["stop"], 250.0)             # stop below the fill
+        self.assertIsNone(captured["limit"])                 # NO limit -> guaranteed-fill market stop
 
     def test_backfill_skips_rejected_buy(self):
         # Top pick's buy is rejected -> still fill MAX_POSITIONS off the spares.
@@ -1122,6 +1100,42 @@ class TestSyncBracketFillsRecording(unittest.TestCase):
         self.assertEqual(store["positions"], [])
 
 
+class TestPerPositionHardStop(unittest.TestCase):
+    """The safety net (2026-06-30): a position whose unrealized P&L falls to
+    PER_POSITION_HARD_STOP is force-closed at market REGARDLESS of its resting order,
+    so a stop that fails to flatten (the stop-LIMIT non-fill that stranded ALGT/RRX)
+    can never leave a position riding unprotected again."""
+
+    def _pos(self, symbol, pl):
+        p = mock.MagicMock()
+        p.symbol = symbol
+        p.unrealized_pl = str(pl)
+        return p
+
+    def test_force_closes_position_past_hard_stop(self):
+        from config import PER_POSITION_HARD_STOP
+        import bot
+        bad = self._pos("AAA", PER_POSITION_HARD_STOP - 5)   # well past the hard stop
+        ok  = self._pos("BBB", -5.0)                         # normal — must be left alone
+        with mock.patch.object(bot, "client") as c:
+            c.get_orders.return_value = [mock.MagicMock(id="o1")]
+            forced = bot.enforce_per_position_hard_stop([bad, ok])
+        self.assertEqual(forced, ["AAA"])
+        c.cancel_order_by_id.assert_called_once_with("o1")   # the stuck resting order is cancelled
+        c.close_position.assert_called_once_with("AAA")      # then force-closed at market
+
+    def test_normal_loss_is_not_force_closed(self):
+        from config import PER_POSITION_STOP
+        import bot
+        # A position sitting at its normal -$20 stop must NOT be force-closed (the bracket
+        # owns that exit); only a genuine FAILURE past the hard stop trips the net.
+        p = self._pos("AAA", PER_POSITION_STOP)
+        with mock.patch.object(bot, "client") as c:
+            forced = bot.enforce_per_position_hard_stop([p])
+        self.assertEqual(forced, [])
+        c.close_position.assert_not_called()
+
+
 class TestPositionLifecycle(unittest.TestCase):
     """Full trade lifecycles, the way the live runs exercised them: a buy that runs
     up and ratchets its trailing stop into PROFIT (and sells there), and a buy that
@@ -1181,10 +1195,6 @@ class TestPositionLifecycle(unittest.TestCase):
         self.assertGreater(lock, 0)                     # a PROFIT lock, never breakeven
         req = c.replace_order_by_id.call_args.args[1]
         self.assertAlmostEqual(float(req.stop_price), 100.0 + lock / 10, places=2)  # above entry
-        # The stop-LIMIT's limit must ratchet UP with the trigger, staying below it —
-        # else a raised trigger could sit above its own (stale) limit and never fill.
-        self.assertLess(float(req.limit_price), float(req.stop_price))
-        self.assertGreater(float(req.limit_price), 0)
         self.assertEqual(store["sl_order_ids"]["AAA"], "new-sl-1")  # tracks the replacement order
 
     def test_up_then_sells_at_the_locked_profit(self):

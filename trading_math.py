@@ -6,8 +6,7 @@ the bracket math was duplicated and could drift), and so the regression suite in
 tests/ can exercise every rule deterministically.
 """
 from config import (
-    PER_POSITION_TARGET, PER_POSITION_STOP, STOP_STEPS,
-    POSITION_NOTIONAL, STOP_LIMIT_SLIP,
+    PER_POSITION_TARGET, PER_POSITION_STOP, STOP_STEPS, POSITION_NOTIONAL,
 )
 
 
@@ -56,31 +55,6 @@ def compute_bracket_prices(price: float, qty: int) -> tuple:
     if stop_price <= 0:
         stop_price = round(price / 2, 2) or round(price / 2, 4)
     return take_profit_price, stop_price
-
-
-def stop_limit_price(stop_price: float, qty: int) -> float:
-    """
-    Limit price for a protective stop-LIMIT sell: STOP_LIMIT_SLIP dollars (total, across
-    the whole position) below the stop trigger.
-
-    When the stop triggers, the position sells as a LIMIT no worse than this price —
-    instead of a plain stop-MARKET that filled at whatever the violent first minutes
-    offered (a -$20 stop slipping to -$45..-$113 was the fat left tail that made a 60%+
-    win rate unprofitable). On a liquid name the fill lands at/near the trigger; the
-    limit only binds in a fast move, capping the loss near -$28 rather than letting it
-    run. If price gaps clean through the limit the order rests unfilled — the daily
-    loss-limit kill switch and the EOD force-close are the backstops for that rare case.
-
-    Floored strictly above $0 (and below the trigger) so a degenerate low-price / high-
-    qty combo can never produce a non-positive or inverted limit that Alpaca rejects.
-    """
-    if qty <= 0:
-        qty = 1
-    offset = max(0.01, round(STOP_LIMIT_SLIP / qty, 2))
-    limit = round(stop_price - offset, 2)
-    if limit <= 0:
-        limit = round(stop_price / 2, 2) or 0.01
-    return limit
 
 
 def select_stop_pl(pl: float, current_step: float, steps=None):
