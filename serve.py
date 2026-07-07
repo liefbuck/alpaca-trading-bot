@@ -50,7 +50,7 @@ def recent_status(path, n=12, markers=STATUS_MARKERS, _chunk=800_000):
 
 def tail(path, n=25, _chunk=16384):
     # Read only the last _chunk bytes instead of the whole file (bot.log can be
-    # several MB and the dashboard polls /logs every 5s). 16 KB easily covers the
+    # several MB and the dashboard polls /logs every 4s). 16 KB easily covers the
     # last n lines; if we didn't start at byte 0 the first line may be partial, so
     # slicing the last n drops it.
     if not os.path.exists(path):

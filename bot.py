@@ -544,7 +544,14 @@ def enforce_per_position_hard_stop(positions):
 
     Cancels the symbol's open orders first (so the now-stale OCO can't later try to sell
     shares we no longer hold), then closes at market. sync_bracket_fills records the P&L
-    on a later cycle once the close settles. Returns the list of symbols force-closed."""
+    on a later cycle once the close settles. Returns the list of symbols force-closed.
+
+    GOTCHA (HONA, 2026-07-06): this runs every ~4s cycle. A market close doesn't settle
+    instantly, so the position can still show here (still P&L <= hard stop) on the very
+    next cycle while its close order is still working. Canceling that live order to
+    "retry" just re-submits against a falling stock at a worse price every cycle — HONA's
+    -$30 hard stop realized as -$52.80 after ~35 cancel/resubmit cycles over 3 minutes.
+    So: if a market sell is already open for the symbol, leave it alone and wait."""
     closed = []
     for pos in positions:
         try:
@@ -554,18 +561,23 @@ def enforce_per_position_hard_stop(positions):
         if pl > PER_POSITION_HARD_STOP:
             continue
         symbol = pos.symbol
+        try:
+            open_orders = list(client.get_orders(GetOrdersRequest(
+                    status=QueryOrderStatus.OPEN, symbols=[symbol], limit=20)))
+        except Exception as e:
+            log.warning(f"  {symbol}: could not list open orders ({e}) — skipping this cycle.")
+            continue
+        if any(o.type == OrderType.MARKET and o.side == OrderSide.SELL for o in open_orders):
+            log.info(f"  {symbol}: hard-stop close already working — waiting for it to fill.")
+            continue
         log.warning(f"HARD STOP {symbol}: P&L ${pl:+.2f} <= ${PER_POSITION_HARD_STOP:.0f} "
                     f"— protective stop failed to flatten; force-closing at market.")
         # Cancel this symbol's resting (stuck) sell orders, then market-close.
-        try:
-            for o in client.get_orders(GetOrdersRequest(
-                    status=QueryOrderStatus.OPEN, symbols=[symbol], limit=20)):
-                try:
-                    client.cancel_order_by_id(o.id)
-                except Exception:
-                    pass
-        except Exception as e:
-            log.warning(f"  {symbol}: could not list/cancel resting orders ({e}) — closing anyway.")
+        for o in open_orders:
+            try:
+                client.cancel_order_by_id(o.id)
+            except Exception:
+                pass
         try:
             client.close_position(symbol)
             closed.append(symbol)
@@ -838,7 +850,7 @@ def close_overnight():
 TZ = "America/New_York"
 schedule.every().day.at("09:29", TZ).do(daily_reset)       # Reset at market pre-open
 schedule.every().day.at("09:30", TZ).do(close_overnight)   # Close any overnight positions (at the open, before entry)
-schedule.every(5).seconds.do(check_pnl)                    # P&L check every 5 sec
+schedule.every(4).seconds.do(check_pnl)                    # P&L check every 4 sec
 schedule.every().day.at("15:45", TZ).do(eod_close)         # Force-close before EOD
 
 # First entry fires at 9:31 — the earliest the market is reliably open with real
@@ -928,4 +940,4 @@ if __name__ == "__main__":
             schedule.run_pending()
         except Exception as e:
             log.error(f"Scheduler error (continuing): {e}")
-        time.sleep(1)  # 1s granularity so check_pnl fires every ~5s
+        time.sleep(1)  # 1s granularity so check_pnl fires every ~4s

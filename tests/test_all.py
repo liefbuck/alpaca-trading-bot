@@ -1112,13 +1112,22 @@ class TestPerPositionHardStop(unittest.TestCase):
         p.unrealized_pl = str(pl)
         return p
 
+    def _open_order(self, order_type, side, order_id="o1"):
+        from alpaca.trading.enums import OrderSide, OrderType
+        o = mock.MagicMock(id=order_id)
+        o.type = order_type
+        o.side = side
+        return o
+
     def test_force_closes_position_past_hard_stop(self):
         from config import PER_POSITION_HARD_STOP
+        from alpaca.trading.enums import OrderSide, OrderType
         import bot
         bad = self._pos("AAA", PER_POSITION_HARD_STOP - 5)   # well past the hard stop
         ok  = self._pos("BBB", -5.0)                         # normal — must be left alone
         with mock.patch.object(bot, "client") as c:
-            c.get_orders.return_value = [mock.MagicMock(id="o1")]
+            # The stuck resting order is the original protective stop, not a market sell.
+            c.get_orders.return_value = [self._open_order(OrderType.STOP, OrderSide.SELL)]
             forced = bot.enforce_per_position_hard_stop([bad, ok])
         self.assertEqual(forced, ["AAA"])
         c.cancel_order_by_id.assert_called_once_with("o1")   # the stuck resting order is cancelled
@@ -1133,6 +1142,23 @@ class TestPerPositionHardStop(unittest.TestCase):
         with mock.patch.object(bot, "client") as c:
             forced = bot.enforce_per_position_hard_stop([p])
         self.assertEqual(forced, [])
+        c.close_position.assert_not_called()
+
+    def test_does_not_cancel_resubmit_a_close_already_working(self):
+        # HONA (2026-07-06): a market close submitted last cycle hadn't settled yet, so
+        # the position still showed here on the very next cycle. The old code canceled
+        # its own in-flight market sell and resubmitted, over and over, while the stock
+        # kept falling — a -$30 hard stop realized as -$52.80 after ~35 such cycles.
+        # Once a market sell is already open for the symbol, this must leave it alone.
+        from config import PER_POSITION_HARD_STOP
+        from alpaca.trading.enums import OrderSide, OrderType
+        import bot
+        bad = self._pos("AAA", PER_POSITION_HARD_STOP - 20)  # still far past the hard stop
+        with mock.patch.object(bot, "client") as c:
+            c.get_orders.return_value = [self._open_order(OrderType.MARKET, OrderSide.SELL)]
+            forced = bot.enforce_per_position_hard_stop([bad])
+        self.assertEqual(forced, [])
+        c.cancel_order_by_id.assert_not_called()
         c.close_position.assert_not_called()
 
 
