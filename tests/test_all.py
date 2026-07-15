@@ -710,6 +710,22 @@ class TestBacktestHarness(unittest.TestCase):
         pl, reason = bt.simulate(tr, bars, pol)
         self.assertEqual(reason, "eod")
 
+    def test_harness_bracket_prices_agree_with_the_bots(self):
+        # The harness derives bracket prices itself (a sweep must vary the target
+        # and stop, which compute_bracket_prices reads from config). That freedom
+        # is only safe while the two agree for the CONFIGURED policy -- otherwise
+        # the backtest silently grades a bracket the bot would never place.
+        import backtest as bt
+        from config import PER_POSITION_TARGET, PER_POSITION_STOP
+        for price, qty in [(100.0, 20), (250.5, 8), (57.33, 34), (913.87, 2)]:
+            tp_bot, sl_bot = tm.compute_bracket_prices(price, qty)
+            tp_bt = price + PER_POSITION_TARGET / qty
+            sl_bt = price + PER_POSITION_STOP / qty
+            self.assertAlmostEqual(tp_bot, tp_bt, delta=0.02,
+                                   msg=f"target drift at price={price} qty={qty}")
+            self.assertAlmostEqual(sl_bot, sl_bt, delta=0.02,
+                                   msg=f"stop drift at price={price} qty={qty}")
+
     def test_harness_uses_the_bots_real_ladder_function(self):
         # Imported, never re-implemented: a copy would silently drift from the bot
         # and the backtest would start grading a strategy that isn't running.
@@ -836,6 +852,33 @@ class TestWatchdogWedgeDetection(unittest.TestCase):
         limit = int(self._ps_var("stallLimitSec"))
         net = int(re.search(r'def wait_for_network\(max_wait_seconds: int = (\d+)', self.bot).group(1))
         self.assertGreater(limit, net)
+
+    def test_singleton_lock_is_machine_wide_not_per_folder(self):
+        # A $baseDir lock can only see a rival inside its own folder, so a second
+        # checkout takes its own lock and both watchdogs duel on one broker
+        # account -- the 2026-06-11 dual-bot failure. The lock must live at one
+        # fixed path every watchdog on the box contends for.
+        self.assertIn("$env:ProgramData", self.wd)
+        lock = __import__("re").search(r'\$lockFile\s*=\s*Join-Path \$lockDir "([^"]+)"', self.wd)
+        self.assertIsNotNone(lock, "machine-wide lock path not found")
+        # The baseDir path may survive ONLY as the not-writable fallback.
+        self.assertNotIn('$lockFile = Join-Path $baseDir ".watchdog.lock"\n$script:lockStream',
+                         self.wd)
+
+    def test_singleton_lock_falls_back_rather_than_running_unlocked(self):
+        # If ProgramData is unwritable, a local lock is worse than a global one
+        # but infinitely better than no singleton at all.
+        block = self.wd[self.wd.index("$lockFile = $null"):]
+        block = block[:block.index("$script:lockStream = $null")]
+        self.assertIn("catch", block)
+        self.assertIn('Join-Path $baseDir ".watchdog.lock"', block)
+
+    def test_discovery_still_matches_the_bare_script_name(self):
+        # Deliberate: a full-path match would stop recognising a hand-launched
+        # `python bot.py` and spawn a SECOND bot -- two bots on one account is far
+        # worse than adopting a stray. Cross-folder rivalry is stopped by the
+        # machine-wide lock instead, not by narrowing this.
+        self.assertIn('$_.CommandLine -like "*$scriptName*"', self.wd)
 
     def test_watchdog_reads_the_same_heartbeat_file_the_bot_writes(self):
         import bot

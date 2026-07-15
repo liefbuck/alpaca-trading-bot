@@ -94,6 +94,15 @@ function Test-Alive($procId) {
 # Best-effort: find a running instance of $script by command line. May miss when
 # CommandLine is $null, so a miss is NOT proof the process is dead.
 #
+# DELIBERATELY matches the BARE script name, not "$baseDir\$script", even though
+# that means it can adopt a bot launched from a different folder. Tightening this
+# to a full path looks tidier and is WORSE: a bot started by hand (or by an older
+# launcher) as `python bot.py` would then stop being recognised, so this would
+# launch a SECOND one -- two bots on one account, doubling every order. That is a
+# far worse failure than adopting a stray. Adoption is the anti-duplicate
+# mechanism, so it must stay generous. Cross-folder rivalry is prevented at the
+# source instead, by the machine-wide singleton lock below.
+#
 # BOUNDED: the Win32_Process enumeration is a CIM/WMI call that can hang if the
 # WMI provider wedges. A hang here used to stall the whole sweep, so a dead bot.py
 # would never be relaunched (this happened ~20 min before the open on 2026-06-11).
@@ -122,7 +131,7 @@ function Find-RunningPid($script) {
 # Singleton guard: never let two watchdogs manage the bots at once (e.g. a SYSTEM
 # at-startup instance plus a per-user logon instance after an unattended reboot).
 #
-# Implemented as an OS-ENFORCED EXCLUSIVE FILE LOCK: we open .watchdog.lock with
+# Implemented as an OS-ENFORCED EXCLUSIVE FILE LOCK: we open the lock file with
 # FileShare.Read (others may READ it for diagnostics, but no second WRITER can open
 # it) and HOLD the handle for the whole life of the watchdog. The OS enforces this
 # across the SYSTEM/user security boundary -- unlike the old guard, which compared
@@ -130,7 +139,24 @@ function Find-RunningPid($script) {
 # SYSTEM boot-watchdog and a user logon-watchdog BOTH ran and dueled on the account
 # (2026-06-11). The OS releases the handle automatically when the process dies, so a
 # restart re-acquires cleanly with no stale-file handling.
-$lockFile = Join-Path $baseDir ".watchdog.lock"
+#
+# The lock lives MACHINE-WIDE, not in $baseDir. A per-folder lock can only see a
+# rival inside its own folder, so a second checkout of this repo elsewhere on the
+# box would take its OWN lock, run happily alongside, and duel on the same broker
+# account -- the very dual-bot failure the lock exists to prevent. One fixed path
+# means every watchdog here contends for the SAME handle no matter where it was
+# launched from. Falls back to $baseDir if ProgramData is not writable: a local
+# lock is worse than a global one, but far better than none.
+$lockFile = $null
+try {
+    $lockDir = Join-Path $env:ProgramData "ClaudeTrading"
+    if (-not (Test-Path $lockDir)) {
+        New-Item -ItemType Directory -Force -Path $lockDir -ErrorAction Stop | Out-Null
+    }
+    $lockFile = Join-Path $lockDir "watchdog.lock"
+} catch {
+    $lockFile = Join-Path $baseDir ".watchdog.lock"
+}
 $script:lockStream = $null
 for ($attempt = 1; ($attempt -le 5) -and (-not $script:lockStream); $attempt++) {
     try {
@@ -146,7 +172,7 @@ for ($attempt = 1; ($attempt -le 5) -and (-not $script:lockStream); $attempt++) 
     }
 }
 if (-not $script:lockStream) {
-    Write-Log "Another watchdog holds the lock - instance $PID exiting."
+    Write-Log "Another watchdog holds $lockFile - instance $PID exiting."
     return
 }
 # Record our PID in the locked file for diagnostics. The stream stays OPEN (never
@@ -158,7 +184,7 @@ try {
     $script:lockStream.Flush()
 } catch {}
 
-Write-Log "Watchdog started (hardened/pid-file/singleton)"
+Write-Log "Watchdog started (hardened/pid-file/singleton; lock $lockFile)"
 
 while ($true) {
     # Guard the whole sweep: a transient failure (CIM hiccup, Start-Process throw)

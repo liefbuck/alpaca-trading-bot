@@ -10,10 +10,16 @@ and how a month of paper losses bought information a laptop could have produced
 in seconds. Ten days of this strategy is statistically indistinguishable from
 nothing; you cannot learn anything from it.
 
-This replays the REAL exit rules (trading_math.select_stop_pl /
-compute_bracket_prices -- imported, never re-implemented, so the harness cannot
-drift from the bot) against REAL minute bars, over REAL historical entries taken
-from broker fills. It answers "what would this bracket have done" in seconds.
+This replays the REAL ladder rule (trading_math.select_stop_pl -- imported, never
+re-implemented, so the harness cannot drift from the bot) against REAL minute
+bars, over REAL historical entries taken from broker fills. It answers "what
+would this bracket have done" in seconds.
+
+Bracket prices are derived here from the ExitPolicy under test rather than via
+compute_bracket_prices(), because that function reads the CONFIGURED target/stop
+from config.py -- which is exactly what a sweep needs to vary. The two must stay
+consistent: entry +/- (target|stop)/qty, which is what compute_bracket_prices
+does modulo its penny-rounding and its degenerate-price floors.
 
 SCOPE -- READ THIS BEFORE BELIEVING ANY NUMBER
 ----------------------------------------------
