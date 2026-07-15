@@ -73,6 +73,44 @@ def select_stop_pl(pl: float, current_step: float, steps=None):
     return None
 
 
+def pair_fills_to_trades(fills: list) -> list:
+    """
+    Rebuild a day's {'symbol','pl'} trade list from raw broker fills.
+
+    Used to RECONSTRUCT a performance row for a day the bot did not survive to
+    15:45 (see backfill_performance_history in bot.py) — the live path records
+    trades into bot_state.json as they close, but that state is wiped by the next
+    daily_reset, so a missed EOD can only be recovered from broker fills.
+
+    `fills` is a list of {'symbol','side','qty','price'} ('side' is 'buy'/'sell').
+    P&L per symbol is proceeds - cost, which reproduces the live bracket math
+    (exit - entry) * qty exactly, and also handles a partially-filled exit that
+    closed across several orders.
+
+    A symbol whose buy and sell quantities do not match is NOT flat — that is an
+    open position, not a completed trade — so it is skipped rather than booked at
+    a bogus P&L.
+    """
+    by_symbol: dict = {}
+    for f in fills:
+        acc = by_symbol.setdefault(f["symbol"], {"buy_qty": 0.0, "cost": 0.0,
+                                                 "sell_qty": 0.0, "proceeds": 0.0})
+        qty, price = float(f["qty"]), float(f["price"])
+        if str(f["side"]).lower().endswith("buy"):
+            acc["buy_qty"] += qty
+            acc["cost"]    += qty * price
+        else:
+            acc["sell_qty"] += qty
+            acc["proceeds"] += qty * price
+
+    trades = []
+    for symbol, acc in sorted(by_symbol.items()):
+        if acc["buy_qty"] <= 0 or acc["buy_qty"] != acc["sell_qty"]:
+            continue
+        trades.append({"symbol": symbol, "pl": round(acc["proceeds"] - acc["cost"], 2)})
+    return trades
+
+
 def classify_trades(trades: list, daily_pnl: float) -> dict:
     """
     Aggregate a list of {'symbol','pl'} trades into the daily performance record.

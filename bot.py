@@ -2,7 +2,7 @@ import os
 import json
 import time
 import schedule
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 from uuid import UUID
 import pytz
 import logging
@@ -11,12 +11,12 @@ from dotenv import load_dotenv
 
 import yfinance as yf
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest
+from alpaca_client import make_trading_client
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, TakeProfitRequest, StopLossRequest, ReplaceOrderRequest, GetPortfolioHistoryRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass, OrderType
 from screener import get_top_momentum
 from config import DAILY_TARGET, DAILY_LOSS_LIMIT, MAX_POSITIONS, PER_POSITION_HARD_STOP
-from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades
+from trading_math import position_size, compute_bracket_prices, select_stop_pl, classify_trades, pair_fills_to_trades
 
 load_dotenv()
 
@@ -47,15 +47,48 @@ ET = pytz.timezone("America/New_York")
 STATE_FILE = os.path.join(BASE_DIR, "bot_state.json")
 PERF_FILE  = os.path.join(BASE_DIR, "performance_log.json")
 
-client = TradingClient(
-    api_key=os.getenv("ALPACA_API_KEY"),
-    secret_key=os.getenv("ALPACA_SECRET_KEY"),
-    paper=True,
-)
+client = make_trading_client(paper=True)
 
 trading_active = True
 _last_api_error_log: float = 0.0       # epoch seconds — rate-limits repeated DNS error logs
 _last_market_closed_log: float = 0.0   # epoch seconds — rate-limits "market closed" log to 1/hr
+_last_perf_snapshot: float = 0.0        # epoch seconds — rate-limits the intraday performance row write
+
+_last_beat: float = 0.0                # epoch seconds - rate-limits the main-loop heartbeat
+
+HEARTBEAT_FILE = os.path.join(BASE_DIR, ".bot.heartbeat")
+HEARTBEAT_S = 15              # how often the main loop stamps proof of progress
+PERF_SNAPSHOT_S = 60          # how often the live loop refreshes today's provisional row
+PERF_BACKFILL_PERIOD = "1M"   # how far back startup rebuilds missed performance rows
+
+
+def beat(force: bool = False):
+    """Stamp proof that the MAIN LOOP is still turning.
+
+    Liveness != progress. watchdog.ps1 could only ever ask "does the PID exist",
+    and a bot wedged on an unbounded HTTP call (see alpaca_client.py) exists
+    perfectly happily while doing nothing — that is why a frozen bot survived
+    untouched for hours with the watchdog reporting it healthy.
+
+    This is called from the main loop AFTER schedule.run_pending() returns, so a
+    job that blocks forever also stops the stamp. That is the whole point: the
+    file answers "did the loop come back", not "is there a process".
+    """
+    global _last_beat
+    now = time.time()
+    if not force and now - _last_beat < HEARTBEAT_S:
+        return
+    _last_beat = now
+    try:
+        tmp = HEARTBEAT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            # pid: the watchdog must ignore a stamp left by a PREVIOUS bot, or it
+            # would read the dead one's stale timestamp and instantly kill the
+            # replacement it just launched — a restart loop.
+            json.dump({"ts": now, "pid": os.getpid()}, f)
+        os.replace(tmp, HEARTBEAT_FILE)
+    except Exception:
+        pass  # a heartbeat problem must never take trading down
 
 
 def save_state(data: dict):
@@ -684,6 +717,8 @@ def check_pnl():
 
     daily_pnl = get_daily_pnl()
     log.info(f"Daily P&L: ${daily_pnl:+.2f}  (limit ${DAILY_LOSS_LIMIT:.0f} | target ${DAILY_TARGET:.0f})")
+    # Keep today's history row current — this process rarely survives to 15:45.
+    snapshot_performance(daily_pnl)
 
     if positions is not None:
         steps_reached = load_state().get("stop_steps_reached", {})
@@ -700,31 +735,38 @@ def check_pnl():
         persist_halted(True)
 
 
-def log_daily_performance():
-    """Append today's summary to performance_log.json."""
-    state = load_state()
-    trades = state.get("trades_today", [])
-    daily_pnl = get_daily_pnl()
-    entry = {
-        "date":      str(datetime.now(ET).date()),
+def load_performance() -> list:
+    if not os.path.exists(PERF_FILE):
+        return []
+    try:
+        with open(PERF_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"performance_log.json unreadable ({e}) — starting fresh history.")
+        return []
+
+
+def build_perf_entry(date: str, daily_pnl: float, trades: list, final: bool) -> dict:
+    return {
+        "date":      date,
         "daily_pnl": round(daily_pnl, 2),
         **classify_trades(trades, daily_pnl),
+        # PROVISIONAL vs SETTLED. A row written intraday reflects P&L *so far*;
+        # only eod_close (or a broker-truth backfill) can mark a day done. The
+        # startup backfill repairs any row still marked False. Rows predating this
+        # field have no "final" key and are treated as settled — never rewritten.
+        "final":     final,
     }
 
-    log.info(f"EOD Summary: {entry}")
 
-    history = []
-    if os.path.exists(PERF_FILE):
-        try:
-            with open(PERF_FILE, encoding="utf-8") as f:
-                history = json.load(f)
-        except Exception as e:
-            log.warning(f"performance_log.json unreadable ({e}) — starting fresh history.")
-            history = []
-
-    # Replace today's entry if it already exists, otherwise append
-    history = [h for h in history if h["date"] != entry["date"]]
-    history.append(entry)
+def upsert_performance(entries: list):
+    """Merge rows into performance_log.json by date, newest write wins."""
+    if not entries:
+        return
+    history = load_performance()
+    dates = {e["date"] for e in entries}
+    history = [h for h in history if h["date"] not in dates]
+    history.extend(entries)
     history.sort(key=lambda x: x["date"])
 
     # Atomic write — prevents corrupt file if process is killed mid-write
@@ -732,6 +774,88 @@ def log_daily_performance():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
     os.replace(tmp, PERF_FILE)
+
+
+def snapshot_performance(daily_pnl: float):
+    """Write today's row PROVISIONALLY, from the live check_pnl loop.
+
+    THE reason 9 trading days (07-06..07-14) were missing from the history: the
+    row used to be written in ONE place, eod_close at 15:45 ET, so it existed only
+    if the process happened to be alive at that exact instant. bot.py is killed
+    mid-session most days and the watchdog only relaunches at logon (next
+    morning), so the 15:45 job never ran and the day was lost for good —
+    schedule's missed jobs do not survive into the fresh morning process.
+    Writing continuously means a mid-day death costs at most the last minute.
+    """
+    global _last_perf_snapshot
+    now_ts = time.time()
+    if now_ts - _last_perf_snapshot < PERF_SNAPSHOT_S:
+        return
+    _last_perf_snapshot = now_ts
+    try:
+        trades = load_state().get("trades_today", [])
+        upsert_performance([build_perf_entry(str(datetime.now(ET).date()),
+                                             daily_pnl, trades, final=False)])
+    except Exception as e:
+        log.warning(f"perf snapshot failed ({e}) — continuing.")
+
+
+def log_daily_performance():
+    """Write today's SETTLED summary to performance_log.json."""
+    state = load_state()
+    trades = state.get("trades_today", [])
+    daily_pnl = get_daily_pnl()
+    entry = build_perf_entry(str(datetime.now(ET).date()), daily_pnl, trades, final=True)
+    log.info(f"EOD Summary: {entry}")
+    upsert_performance([entry])
+
+
+def fetch_day_trades(day) -> list:
+    """Reconstruct a past day's completed trades from broker fills."""
+    after = ET.localize(datetime.combine(day, dt_time(0, 0)))
+    until = after + timedelta(days=1)
+    orders = client.get_orders(GetOrdersRequest(
+        status=QueryOrderStatus.CLOSED, after=after, until=until, limit=500, nested=False))
+    fills = [{"symbol": o.symbol, "side": o.side.value,
+              "qty": o.filled_qty, "price": o.filled_avg_price}
+             for o in orders
+             if o.filled_qty and float(o.filled_qty) > 0 and o.filled_avg_price]
+    return pair_fills_to_trades(fills)
+
+
+def backfill_performance_history():
+    """Rebuild any missing/provisional past rows from the broker's own record.
+
+    Self-heals the history whenever the bot misses a 15:45 EOD (killed mid-session,
+    reboot, crash). Alpaca's portfolio history is the source of truth for BOTH
+    "was this a trading day" (1D bars exist only for sessions) and the day's P&L
+    (the bot flattens every day at 15:45, so day-over-day equity change IS that
+    day's trading P&L). Per-trade detail comes from that day's fills.
+
+    Only touches PAST days that are missing or still provisional — a settled row,
+    and today's live row, are never rewritten.
+    """
+    history = load_performance()
+    settled = {h["date"] for h in history if h.get("final", True)}
+    today = str(datetime.now(ET).date())
+
+    hist = client.get_portfolio_history(
+        GetPortfolioHistoryRequest(period=PERF_BACKFILL_PERIOD, timeframe="1D"))
+    sessions = [(datetime.fromtimestamp(ts, ET).date(), pl)
+                for ts, pl in zip(hist.timestamp, hist.profit_loss) if pl is not None]
+
+    rebuilt = []
+    for day, daily_pnl in sessions:
+        date = str(day)
+        if date >= today or date in settled:
+            continue
+        trades = fetch_day_trades(day)
+        rebuilt.append(build_perf_entry(date, float(daily_pnl), trades, final=True))
+        log.info(f"Backfilled {date}: P&L ${float(daily_pnl):+.2f} over {len(trades)} trade(s)")
+
+    if rebuilt:
+        upsert_performance(rebuilt)
+        log.info(f"Performance history backfilled — {len(rebuilt)} day(s) recovered.")
 
 
 def eod_close():
@@ -875,6 +999,7 @@ def wait_for_network(max_wait_seconds: int = 300, interval: int = 15):
         except Exception as e:
             remaining = int(deadline - time.time())
             log.warning(f"Network not ready (attempt {attempt}, {remaining}s remaining): {e}")
+            beat(force=True)  # a slow boot network is NOT a wedge
             time.sleep(interval)
     log.error("Alpaca API still unreachable after startup wait — continuing anyway.")
 
@@ -884,6 +1009,9 @@ if __name__ == "__main__":
     log.info("Trading bot started")
     log.info(f"Daily target: ${DAILY_TARGET} | Loss limit: ${DAILY_LOSS_LIMIT}")
     log.info("=" * 60)
+    # Claim the heartbeat with our pid before the slow startup phases below, so
+    # the watchdog reads OUR stamp rather than the previous bot's stale one.
+    beat(force=True)
     wait_for_network()
     # On startup: if state file has no baseline for today, reset it now so
     # check_pnl doesn't immediately see a stale loss and kill trading.
@@ -935,9 +1063,20 @@ if __name__ == "__main__":
         else:
             log.info(f"Startup catchup: already holding {len(existing)} position(s), skipping entry.")
 
+    # Repair the history for any day we missed the 15:45 EOD on. Runs AFTER the
+    # catchup entry above so its per-day fill queries can never delay an entry,
+    # and never fatally — a broken history must not stop the bot from trading.
+    try:
+        backfill_performance_history()
+    except Exception as e:
+        log.error(f"Startup: performance backfill failed ({e}) — continuing.")
+
     while True:
         try:
             schedule.run_pending()
         except Exception as e:
             log.error(f"Scheduler error (continuing): {e}")
+        # AFTER run_pending, never before: a job that blocks forever must stop
+        # the stamp, which is exactly what tells the watchdog we are wedged.
+        beat()
         time.sleep(1)  # 1s granularity so check_pnl fires every ~4s

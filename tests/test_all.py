@@ -11,6 +11,7 @@ would touch Alpaca or yfinance is mocked.
 import os
 import sys
 import json
+import time
 import logging
 import tempfile
 import unittest
@@ -32,6 +33,20 @@ ET = pytz.timezone("America/New_York")
 
 import trading_math as tm
 from config import MAX_POSITIONS
+
+# Hermetic-by-default: point bot's data files at a throwaway dir for the WHOLE
+# suite. Individual tests still patch these to their own temp paths; this is the
+# backstop for any code path a test forgets to isolate. Without it, a test that
+# calls a function which grew a new write (check_pnl -> snapshot_performance did
+# exactly this) silently CORRUPTS the real performance_log.json / bot_state.json
+# — a bogus 0-trade row for today landed in the live history this way.
+_SANDBOX = tempfile.mkdtemp(prefix="bot_tests_")
+
+
+def setUpModule():
+    import bot
+    bot.PERF_FILE  = os.path.join(_SANDBOX, "performance_log.json")
+    bot.STATE_FILE = os.path.join(_SANDBOX, "bot_state.json")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -611,6 +626,375 @@ class TestPerformanceLogDedup(unittest.TestCase):
             today_entry = next(h for h in hist if h["date"] == today)
             self.assertEqual(today_entry["result"], "WIN")
             self.assertEqual(today_entry["daily_pnl"], 42.0)
+
+
+class TestHeartbeat(unittest.TestCase):
+    """The bot must prove PROGRESS, not mere existence."""
+
+    def _read(self, path):
+        with open(path) as fh:
+            return json.load(fh)
+
+    def test_beat_stamps_ts_and_pid(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            hb = os.path.join(d, ".bot.heartbeat")
+            with mock.patch.object(bot, "HEARTBEAT_FILE", hb), \
+                 mock.patch.object(bot, "_last_beat", 0.0):
+                bot.beat(force=True)
+            data = self._read(hb)
+            # pid is what stops the watchdog acting on a DEAD bot's stamp.
+            self.assertEqual(data["pid"], os.getpid())
+            self.assertLess(abs(data["ts"] - time.time()), 30)
+
+    def test_beat_is_rate_limited_but_force_overrides(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            hb = os.path.join(d, ".bot.heartbeat")
+            with mock.patch.object(bot, "HEARTBEAT_FILE", hb), \
+                 mock.patch.object(bot, "_last_beat", 0.0):
+                bot.beat(force=True)
+                first = self._read(hb)["ts"]
+                bot.beat()                      # rate-limited -> no rewrite
+                self.assertEqual(self._read(hb)["ts"], first)
+                time.sleep(0.01)
+                bot.beat(force=True)            # force -> rewrite
+                self.assertGreater(self._read(hb)["ts"], first)
+
+    def test_beat_never_raises(self):
+        # A heartbeat problem must never be able to take trading down.
+        import bot
+        with mock.patch.object(bot, "HEARTBEAT_FILE", os.path.join(_SANDBOX, "no", "such", "dir", "hb")), \
+             mock.patch.object(bot, "_last_beat", 0.0):
+            bot.beat(force=True)   # must not raise
+
+    def test_main_loop_beats_after_run_pending_not_before(self):
+        # Ordering IS the design: beating before run_pending() would keep
+        # stamping "healthy" while a job blocks forever, defeating the detector.
+        with open(os.path.join(ROOT, "bot.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        loop = src[src.index("    while True:"):]
+        self.assertLess(loop.index("schedule.run_pending()"), loop.index("beat()"))
+
+    def test_startup_claims_heartbeat_before_slow_phases(self):
+        # The bot must stamp its own pid before wait_for_network/backfill, or the
+        # watchdog reads the PREVIOUS bot's stale stamp and kills this one.
+        with open(os.path.join(ROOT, "bot.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        main = src[src.index('if __name__ == "__main__":'):]
+        self.assertLess(main.index("beat(force=True)"), main.index("wait_for_network()"))
+
+
+class TestWatchdogWedgeDetection(unittest.TestCase):
+    """watchdog.ps1's restart window must stay pinned to bot.py's real schedule."""
+
+    def setUp(self):
+        with open(os.path.join(ROOT, "watchdog.ps1"), encoding="ascii") as fh:
+            self.wd = fh.read()
+        with open(os.path.join(ROOT, "bot.py"), encoding="utf-8") as fh:
+            self.bot = fh.read()
+
+    def _ps_var(self, name):
+        m = __import__("re").search(rf'^\${name}\s*=\s*"?([^"\r\n]+)"?', self.wd, __import__("re").M)
+        self.assertIsNotNone(m, f"${name} not found in watchdog.ps1")
+        return m.group(1).strip()
+
+    def _window(self):
+        parse = lambda s: dt.datetime.strptime(s, "%H:%M").time()
+        return parse(self._ps_var("noRestartFromET")), parse(self._ps_var("noRestartToET"))
+
+    def test_window_covers_every_entry_time(self):
+        import re
+        entries = re.search(r'for _t in \[([^\]]+)\]', self.bot).group(1)
+        entries = [dt.datetime.strptime(t.strip().strip('"'), "%H:%M").time()
+                   for t in entries.split(",")]
+        self.assertTrue(entries)
+        lo, hi = self._window()
+        for t in entries:
+            self.assertGreaterEqual(t, lo, f"entry {t} starts before the no-restart window")
+            self.assertLessEqual(t, hi, f"entry {t} is outside the no-restart window")
+
+    def test_window_outlasts_the_last_entry_plus_its_fill_budget(self):
+        # Entry work is still in flight for ENTRY_BUDGET_S after the last buy;
+        # a kill during it can strand a filled-but-unprotected position.
+        import re
+        budget = float(re.search(r'ENTRY_BUDGET_S\s*=\s*([\d.]+)', self.bot).group(1))
+        entries = re.search(r'for _t in \[([^\]]+)\]', self.bot).group(1)
+        last = max(dt.datetime.strptime(t.strip().strip('"'), "%H:%M").time()
+                   for t in entries.split(","))
+        last_dt = dt.datetime.combine(dt.date(2026, 1, 1), last) + dt.timedelta(seconds=budget)
+        _, hi = self._window()
+        self.assertGreaterEqual(dt.datetime.combine(dt.date(2026, 1, 1), hi), last_dt)
+
+    def test_window_ends_after_the_catchup_cutoff_so_a_restart_cannot_re_enter(self):
+        # THE safety property. bot.py re-enters on startup only before its 10:30
+        # cutoff; if the window ended earlier, a wedge-restart could fire inside
+        # the catchup range and double up the day's positions.
+        import re
+        h, m = re.search(r'entry_cutoff\s*=\s*now_et\.replace\(hour=(\d+), minute=(\d+)', self.bot).groups()
+        cutoff = dt.time(int(h), int(m))
+        _, hi = self._window()
+        self.assertGreater(hi, cutoff,
+                           "no-restart window must outlast bot.py's catchup cutoff")
+
+    def test_stall_limit_exceeds_the_startup_network_wait(self):
+        # wait_for_network can legitimately block ~300s on a slow boot. If the
+        # stall limit were under that, the watchdog would kill every cold start.
+        import re
+        limit = int(self._ps_var("stallLimitSec"))
+        net = int(re.search(r'def wait_for_network\(max_wait_seconds: int = (\d+)', self.bot).group(1))
+        self.assertGreater(limit, net)
+
+    def test_watchdog_reads_the_same_heartbeat_file_the_bot_writes(self):
+        import bot
+        self.assertIn(os.path.basename(bot.HEARTBEAT_FILE), self.wd)
+
+    def test_uncertain_heartbeat_reads_never_kill(self):
+        # Every bail-out in Test-Wedged must return $false: an unreadable or
+        # foreign stamp is not evidence of a wedge.
+        fn = self.wd[self.wd.index("function Test-Wedged"):]
+        fn = fn[:fn.index("\n}")]
+        self.assertIn("if ([int]$hb.pid -ne [int]$procId) { return $false }", fn)
+        self.assertIn("if (-not (Test-Path $botHeartbeat)) { return $false }", fn)
+        self.assertIn("catch {\n        return $false\n    }", fn)
+
+
+class TestHttpTimeout(unittest.TestCase):
+    """THE mid-session killer: alpaca-py never sets a request timeout.
+
+    bot.py is single-threaded, so one unbounded call freezes the whole scheduler
+    silently — process alive (watchdog sees "healthy"), log dead, no EOD row.
+    """
+
+    def test_session_injects_a_default_timeout(self):
+        import alpaca_client
+        sess = alpaca_client.TimeoutSession()
+        captured = {}
+        with mock.patch("requests.Session.request",
+                        side_effect=lambda *a, **kw: captured.update(kw)):
+            sess.request("GET", "http://example.invalid")
+        self.assertEqual(captured.get("timeout"), alpaca_client.HTTP_TIMEOUT)
+
+    def test_explicit_timeout_is_not_overridden(self):
+        import alpaca_client
+        sess = alpaca_client.TimeoutSession()
+        captured = {}
+        with mock.patch("requests.Session.request",
+                        side_effect=lambda *a, **kw: captured.update(kw)):
+            sess.request("GET", "http://example.invalid", timeout=1)
+        self.assertEqual(captured.get("timeout"), 1)
+
+    def test_timeout_is_bounded_and_finite(self):
+        import alpaca_client
+        connect, read = alpaca_client.HTTP_TIMEOUT
+        self.assertGreater(connect, 0)
+        self.assertGreater(read, 0)
+        # Must stay well under the ~15min gap between scheduled entry windows.
+        self.assertLess(connect + read, 120)
+
+    def test_factory_actually_installs_the_session(self):
+        # Guards the reach into alpaca-py's private _session: an SDK upgrade that
+        # breaks the injection must fail HERE, not silently restore the hang.
+        import alpaca_client
+        c = alpaca_client.make_trading_client(paper=True)
+        self.assertIsInstance(c._session, alpaca_client.TimeoutSession)
+
+    def test_bot_client_has_the_timeout_session(self):
+        import bot, alpaca_client
+        self.assertIsInstance(bot.client._session, alpaca_client.TimeoutSession)
+
+    def test_no_module_builds_a_raw_tradingclient(self):
+        # Every entry point must go through the factory, or it silently reverts
+        # to the unbounded-hang behaviour.
+        import glob
+        for path in glob.glob(os.path.join(ROOT, "*.py")):
+            if os.path.basename(path) == "alpaca_client.py":
+                continue
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+            self.assertNotIn("TradingClient(", src,
+                             f"{os.path.basename(path)} builds a client directly — "
+                             "use alpaca_client.make_trading_client()")
+
+    def test_call_against_a_blackhole_socket_raises_instead_of_hanging(self):
+        # End-to-end proof, and the real regression guard: a socket that ACCEPTS
+        # but never answers (what this host's network blip produces) used to block
+        # forever. It must now raise within the timeout.
+        import socket, threading
+        import alpaca_client
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        self.addCleanup(srv.close)
+        held = []
+
+        def blackhole():
+            try:
+                while True:
+                    conn, _ = srv.accept()
+                    held.append(conn)   # keep open, answer nothing
+            except OSError:
+                pass
+        threading.Thread(target=blackhole, daemon=True).start()
+
+        c = alpaca_client.make_trading_client(paper=True)
+        c._base_url = f"http://127.0.0.1:{srv.getsockname()[1]}"
+        c._session.timeout = (2, 3)   # keep the test fast
+
+        t0 = time.time()
+        with self.assertRaises(Exception) as ctx:
+            c.get_clock()
+        elapsed = time.time() - t0
+        self.assertIn("timeout", type(ctx.exception).__name__.lower() + str(ctx.exception).lower())
+        self.assertLess(elapsed, 20, "call did not bail out — the hang is back")
+
+
+class TestPairFillsToTrades(unittest.TestCase):
+    def test_reproduces_live_bracket_pnl(self):
+        # Real 2026-07-09 fills: bot.log recorded "SOLS: entry $63.05 -> exit
+        # $63.02 | P&L $-0.93". Reconstruction from fills must agree exactly.
+        trades = tm.pair_fills_to_trades([
+            {"symbol": "SOLS", "side": "buy",  "qty": "31", "price": "63.05"},
+            {"symbol": "SOLS", "side": "sell", "qty": "31", "price": "63.02"},
+        ])
+        self.assertEqual(trades, [{"symbol": "SOLS", "pl": -0.93}])
+
+    def test_sums_partial_exits(self):
+        trades = tm.pair_fills_to_trades([
+            {"symbol": "AAA", "side": "buy",  "qty": "10", "price": "100"},
+            {"symbol": "AAA", "side": "sell", "qty": "4",  "price": "110"},
+            {"symbol": "AAA", "side": "sell", "qty": "6",  "price": "105"},
+        ])
+        self.assertEqual(trades, [{"symbol": "AAA", "pl": 70.0}])
+
+    def test_skips_symbol_that_is_not_flat(self):
+        # An unsold position is an OPEN trade, not a completed one — booking it
+        # would invent a fictitious full-value loss.
+        trades = tm.pair_fills_to_trades([
+            {"symbol": "AAA", "side": "buy",  "qty": "10", "price": "100"},
+            {"symbol": "BBB", "side": "buy",  "qty": "5",  "price": "50"},
+            {"symbol": "BBB", "side": "sell", "qty": "5",  "price": "52"},
+        ])
+        self.assertEqual(trades, [{"symbol": "BBB", "pl": 10.0}])
+
+    def test_empty_day(self):
+        self.assertEqual(tm.pair_fills_to_trades([]), [])
+
+
+class TestPerformanceDurability(unittest.TestCase):
+    """The history must survive the bot dying before the 15:45 EOD."""
+
+    def test_check_pnl_snapshots_todays_row(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf  = os.path.join(d, "perf.json")
+            state = os.path.join(d, "state.json")
+            today = str(dt.datetime.now(ET).date())
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "STATE_FILE", state), \
+                 mock.patch.object(bot, "_last_perf_snapshot", 0.0), \
+                 mock.patch.object(bot, "trading_active", True), \
+                 mock.patch.object(bot, "is_market_open", return_value=True), \
+                 mock.patch.object(bot, "get_daily_pnl", return_value=-31.90), \
+                 mock.patch.object(bot, "client") as cl:
+                cl.get_all_positions.return_value = []
+                bot.save_state({"trades_today": [{"symbol": "SOLS", "pl": -0.93}]})
+                bot.check_pnl()
+            with open(perf) as f:
+                hist = json.load(f)
+            self.assertEqual([h["date"] for h in hist], [today])
+            self.assertEqual(hist[0]["daily_pnl"], -31.9)
+            # Provisional: the day is not over, so a later backfill may repair it.
+            self.assertFalse(hist[0]["final"])
+
+    def test_snapshot_is_rate_limited(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf = os.path.join(d, "perf.json")
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "_last_perf_snapshot", time.time()):
+                bot.snapshot_performance(-10.0)
+            self.assertFalse(os.path.exists(perf))
+
+    def test_eod_marks_row_final(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf, state = os.path.join(d, "perf.json"), os.path.join(d, "state.json")
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "STATE_FILE", state), \
+                 mock.patch.object(bot, "get_daily_pnl", return_value=42.0):
+                bot.save_state({"trades_today": [{"symbol": "A", "pl": 42.0}]})
+                bot.log_daily_performance()
+            with open(perf) as f:
+                hist = json.load(f)
+            self.assertTrue(hist[0]["final"])
+
+
+class TestPerformanceBackfill(unittest.TestCase):
+    """Startup must rebuild rows for days the bot missed the 15:45 EOD on."""
+
+    def _run(self, seed, sessions, day_trades):
+        import bot
+        d = tempfile.mkdtemp()
+        perf = os.path.join(d, "perf.json")
+        with open(perf, "w") as f:
+            json.dump(seed, f)
+        hist_obj = mock.Mock()
+        hist_obj.timestamp   = [int(ET.localize(dt.datetime.combine(day, dt.time(12, 0))).timestamp())
+                               for day, _ in sessions]
+        hist_obj.profit_loss = [pl for _, pl in sessions]
+        with mock.patch.object(bot, "PERF_FILE", perf), \
+             mock.patch.object(bot, "fetch_day_trades", side_effect=lambda day: day_trades.get(str(day), [])), \
+             mock.patch.object(bot, "client") as cl:
+            cl.get_portfolio_history.return_value = hist_obj
+            bot.backfill_performance_history()
+        with open(perf) as f:
+            return json.load(f)
+
+    def test_recovers_missing_day_from_broker_truth(self):
+        hist = self._run(
+            seed=[],
+            sessions=[(dt.date(2026, 7, 9), -31.94)],
+            day_trades={"2026-07-09": [{"symbol": "SOLS", "pl": -0.93},
+                                       {"symbol": "UCTT", "pl": -31.01}]},
+        )
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["date"], "2026-07-09")
+        self.assertEqual(hist[0]["daily_pnl"], -31.94)
+        self.assertEqual(hist[0]["trades"], 2)
+        self.assertEqual(hist[0]["result"], "LOSS")
+        self.assertTrue(hist[0]["final"])
+
+    def test_never_rewrites_a_settled_row(self):
+        # Rows written before "final" existed have no such key and are settled.
+        seed = [{"date": "2026-07-09", "daily_pnl": 999.0, "result": "WIN"}]
+        hist = self._run(seed, [(dt.date(2026, 7, 9), -31.94)], {})
+        self.assertEqual(hist[0]["daily_pnl"], 999.0)
+
+    def test_repairs_a_provisional_row(self):
+        # A day whose bot died mid-session left a stale intraday row: the loss
+        # limit tripped at -213.51 but the day actually settled at -244.93.
+        seed = [{"date": "2026-07-14", "daily_pnl": -213.51, "result": "LOSS", "final": False}]
+        hist = self._run(seed, [(dt.date(2026, 7, 14), -244.93)],
+                         {"2026-07-14": [{"symbol": "X", "pl": -244.93}]})
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["daily_pnl"], -244.93)
+        self.assertTrue(hist[0]["final"])
+
+    def test_leaves_today_alone(self):
+        # Today's row is still live — settling it mid-session would freeze it.
+        today = dt.datetime.now(ET).date()
+        hist = self._run([], [(today, -50.0)], {})
+        self.assertEqual(hist, [])
+
+    def test_no_trade_session_still_gets_a_row(self):
+        # 2026-07-13: the SPY gate skipped every entry. A flat day is real data,
+        # and used to be lost entirely because record_trade never fired.
+        hist = self._run([], [(dt.date(2026, 7, 13), 0.0)], {})
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["trades"], 0)
+        self.assertEqual(hist[0]["daily_pnl"], 0.0)
+        self.assertEqual(hist[0]["result"], "WIN")
 
 
 class TestSpyFilter(unittest.TestCase):
@@ -1434,6 +1818,15 @@ class TestSourceGuards(unittest.TestCase):
         self.assertIn("OrderClass.BRACKET", src)
         # Safe baseline: never fall back to yesterday's close.
         self.assertNotIn("last_equity", src)
+
+    def test_suite_never_writes_the_real_data_files(self):
+        # The suite runs against the live repo, so a test that exercises a write
+        # path without isolating it silently rewrites real trading history. Assert
+        # the module-level sandbox is actually in force.
+        import bot
+        self.assertTrue(bot.PERF_FILE.startswith(_SANDBOX), bot.PERF_FILE)
+        self.assertTrue(bot.STATE_FILE.startswith(_SANDBOX), bot.STATE_FILE)
+        self.assertNotEqual(os.path.dirname(bot.PERF_FILE), ROOT)
 
     def test_shell_scripts_are_pure_ascii(self):
         # Windows PowerShell 5.1 / cmd.exe read a no-BOM script in the legacy

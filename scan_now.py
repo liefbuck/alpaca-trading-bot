@@ -1,7 +1,7 @@
 import os
 import time
 from dotenv import load_dotenv
-from alpaca.trading.client import TradingClient
+from alpaca_client import make_trading_client
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from screener import get_top_momentum
@@ -10,11 +10,7 @@ from trading_math import position_size, compute_bracket_prices
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-client = TradingClient(
-    api_key=os.getenv("ALPACA_API_KEY"),
-    secret_key=os.getenv("ALPACA_SECRET_KEY"),
-    paper=True,
-)
+client = make_trading_client(paper=True)
 
 clock = client.get_clock()
 if not clock.is_open:

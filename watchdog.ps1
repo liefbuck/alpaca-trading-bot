@@ -18,6 +18,65 @@ $baseDir = $PSScriptRoot
 $log     = "$baseDir\watchdog.log"
 $scripts = @("bot.py", "serve.py", "step_watch.py")
 
+# --- Wedge detection ---------------------------------------------------------
+# Test-Alive only proves a PID EXISTS. A bot frozen on an unbounded HTTP call
+# exists perfectly happily while trading blind: no stops ratchet, no 15:45 EOD.
+# That went unnoticed for hours at a time because "the process is there" was the
+# only question this watchdog knew how to ask. bot.py now stamps .bot.heartbeat
+# from its main loop, so we can ask the real question: is it making PROGRESS.
+$botHeartbeat = Join-Path $baseDir ".bot.heartbeat"
+
+# Must exceed the longest LEGITIMATE main-loop block outside the entry window
+# (wait_for_network is up to 300s at boot), while still being ~20x faster than
+# the multi-hour freezes it replaces.
+$stallLimitSec = 900
+
+# NEVER auto-restart mid-entry. bot.py buys at 09:31/09:48/10:03/10:18 with a
+# 300s fill budget, so entry work can still be in flight until ~10:23; killing it
+# then can strand a filled-but-unprotected position. The window ends AFTER
+# bot.py's own 10:30 startup-catchup cutoff, deliberately: a restart at 10:35
+# cannot re-enter and double up the day's positions. A bot that wedges during
+# entry is therefore recovered the moment it is safe to do so, not never.
+# tests/test_all.py pins these to bot.py's real schedule.
+$noRestartFromET = "09:25"
+$noRestartToET   = "10:35"
+
+# The bot schedules in Eastern; this box may not be. Ask for Eastern explicitly
+# rather than assuming local time == ET.
+function Get-EasternNow {
+    try {
+        $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+        return [System.TimeZoneInfo]::ConvertTime([DateTimeOffset]::Now, $tz).DateTime
+    } catch {
+        return (Get-Date)
+    }
+}
+
+function Test-InEntryWindow {
+    $t = (Get-EasternNow).TimeOfDay
+    return (($t -ge [TimeSpan]::Parse($noRestartFromET)) -and ($t -le [TimeSpan]::Parse($noRestartToET)))
+}
+
+# True only when $script is bot.py AND its own heartbeat has gone stale.
+# Returns FALSE whenever we cannot be sure (no file, unreadable, or the stamp
+# belongs to a different pid) -- an uncertain read must never kill a healthy bot.
+function Test-Wedged($script, $procId) {
+    if ($script -ne "bot.py") { return $false }
+    if (-not (Test-Path $botHeartbeat)) { return $false }
+    try {
+        $hb = Get-Content $botHeartbeat -Raw -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    if ($null -eq $hb.pid -or $null -eq $hb.ts) { return $false }
+    # A stamp from a PREVIOUS bot is not evidence about THIS one. Without this,
+    # a freshly relaunched bot would inherit the dead one's stale timestamp and
+    # be killed on the very next sweep -- an endless restart loop.
+    if ([int]$hb.pid -ne [int]$procId) { return $false }
+    $ageSec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double]$hb.ts
+    return ($ageSec -gt $stallLimitSec)
+}
+
 function Write-Log($msg) {
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     Add-Content $log "$ts  $msg"
@@ -112,7 +171,24 @@ while ($true) {
                 $procId = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
             }
 
-            if (Test-Alive $procId) { continue }   # tracked process alive -> nothing to do
+            if (Test-Alive $procId) {
+                # Alive, but is it WORKING? (see Test-Wedged)
+                if (-not (Test-Wedged $script $procId)) { continue }
+
+                if (Test-InEntryWindow) {
+                    Write-Log "WEDGED: $script (PID $procId) heartbeat stale >$stallLimitSec s - inside the $noRestartFromET-$noRestartToET ET entry window, NOT restarting (a kill here can strand an unprotected position). Will recover after $noRestartToET."
+                    continue
+                }
+
+                Write-Log "WEDGED: $script (PID $procId) alive but heartbeat stale >$stallLimitSec s - killing so it can be relaunched."
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3   # let the kill settle before discovery re-queries
+                if (Test-Alive $procId) {
+                    Write-Log "WEDGED: $script (PID $procId) survived the kill - will retry next sweep."
+                    continue
+                }
+                # falls through to relaunch below
+            }
 
             # Tracked PID dead/unknown. Try to adopt an existing instance before
             # relaunching, with one retry, so a transient null read can't duplicate.

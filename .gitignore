@@ -11,5 +11,7 @@ install_boot_task.log
 .claude/
 .watchdog.lock
 .watchdog.heartbeat
+.bot.heartbeat
+performance_log.json.bak_*
 watchdog.log
 _archived/*.log
