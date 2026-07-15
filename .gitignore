@@ -15,3 +15,4 @@ install_boot_task.log
 performance_log.json.bak_*
 watchdog.log
 _archived/*.log
+.backtest_cache/

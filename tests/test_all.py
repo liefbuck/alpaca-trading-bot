@@ -628,6 +628,98 @@ class TestPerformanceLogDedup(unittest.TestCase):
             self.assertEqual(today_entry["daily_pnl"], 42.0)
 
 
+class TestBacktestHarness(unittest.TestCase):
+    """The harness decides what ships, so its biases must stay honest.
+
+    Bars are (timestamp, open, high, low, close).
+    """
+
+    def _bars(self, day, rows):
+        t0 = ET.localize(dt.datetime.combine(day, dt.time(9, 40)))
+        return [(t0 + dt.timedelta(minutes=i), *r) for i, r in enumerate(rows)]
+
+    def _trade(self, day, qty=20, entry=100.0):
+        return {"day": day, "sym": "X", "qty": qty, "entry": entry,
+                "entry_at": ET.localize(dt.datetime.combine(day, dt.time(9, 40)))}
+
+    def test_ambiguous_bar_resolves_against_the_strategy(self):
+        # One bar touches BOTH the -$20 stop and the +$40 target. A backtest that
+        # books the target here is how you get a strategy that only works offline.
+        import backtest as bt
+        day = dt.date(2026, 6, 15)
+        # qty 20 -> stop at 99.00, target at 102.00. This bar spans both.
+        bars = self._bars(day, [(100.0, 103.0, 98.0, 100.0), (100.0, 100.0, 100.0, 100.0)])
+        pol = bt.ExitPolicy("t", target=40.0, stop=-20.0, use_ladder=False)
+        pl, reason = bt.simulate(self._trade(day), bars, pol)
+        self.assertEqual(reason, "stop")
+        self.assertLess(pl, 0)
+
+    def test_stop_fills_at_next_bar_open_not_the_trigger(self):
+        # A stop is a MARKET order: it cannot fill at its own trigger price.
+        import backtest as bt
+        day = dt.date(2026, 6, 15)
+        bars = self._bars(day, [(100.0, 100.0, 98.0, 98.5), (97.0, 97.0, 97.0, 97.0)])
+        pol = bt.ExitPolicy("t", target=40.0, stop=-20.0, use_ladder=False)
+        pl, reason = bt.simulate(self._trade(day), bars, pol)
+        self.assertEqual(reason, "stop")
+        self.assertAlmostEqual(pl, (97.0 - 100.0) * 20, places=2)   # gapped through, not -$20
+
+    def test_target_fills_exactly_at_its_limit_never_better(self):
+        import backtest as bt
+        day = dt.date(2026, 6, 15)
+        bars = self._bars(day, [(100.0, 105.0, 100.0, 105.0)])   # blew past +$40
+        pol = bt.ExitPolicy("t", target=40.0, stop=-20.0, use_ladder=False)
+        pl, reason = bt.simulate(self._trade(day), bars, pol)
+        self.assertEqual(reason, "target")
+        self.assertAlmostEqual(pl, 40.0, places=2)                # not the 105 print
+
+    def test_ladder_ratchets_on_close_not_high(self):
+        # Crediting the intra-minute HIGH locks profit a 4s-polling bot never saw
+        # and flatters results by ~$2/trade. Bar 1 spikes to +$5 on the high but
+        # closes flat -> no rung may fire.
+        import backtest as bt
+        day = dt.date(2026, 6, 15)
+        bars = self._bars(day, [(100.0, 100.25, 100.0, 100.0),    # high = +$5, close = +$0
+                                (100.0, 100.0, 99.9, 99.95),
+                                (99.95, 99.95, 99.95, 99.95)])
+        pol = bt.ExitPolicy("t", target=40.0, stop=-20.0, steps=[(5, 3)])
+        pl, reason = bt.simulate(self._trade(day), bars, pol)
+        # If it had ratcheted on the high it would lock +$3 and stop out at +$3.
+        self.assertNotAlmostEqual(pl, 3.0, places=2)
+
+    def test_a_raised_stop_only_applies_from_the_next_bar(self):
+        # Must never lock a profit and stop against the very bar that locked it.
+        import backtest as bt
+        day = dt.date(2026, 6, 15)
+        # Bar 1 closes +$10 (rung (5,3) fires -> stop to +$3 = 100.15) and its own
+        # low is below that; the exit may only happen on a LATER bar.
+        bars = self._bars(day, [(100.0, 100.5, 100.0, 100.5), (100.5, 100.5, 100.0, 100.1)])
+        pol = bt.ExitPolicy("t", target=40.0, stop=-20.0, steps=[(5, 3)])
+        pl, reason = bt.simulate(self._trade(day), bars, pol)
+        self.assertEqual(reason, "stop")
+        self.assertGreater(pl, 0)   # locked the +$3 rung, not stopped at a loss
+
+    def test_eod_forces_a_close_at_1545(self):
+        import backtest as bt
+        day = dt.date(2026, 6, 15)
+        t0 = ET.localize(dt.datetime.combine(day, dt.time(15, 44)))
+        bars = [(t0, 100.0, 100.0, 100.0, 100.0),
+                (t0 + dt.timedelta(minutes=1), 101.0, 101.0, 101.0, 101.0)]
+        tr = {"day": day, "sym": "X", "qty": 20, "entry": 100.0, "entry_at": t0}
+        pol = bt.ExitPolicy("t", target=40.0, stop=-20.0, use_ladder=False)
+        pl, reason = bt.simulate(tr, bars, pol)
+        self.assertEqual(reason, "eod")
+
+    def test_harness_uses_the_bots_real_ladder_function(self):
+        # Imported, never re-implemented: a copy would silently drift from the bot
+        # and the backtest would start grading a strategy that isn't running.
+        import backtest as bt
+        import trading_math
+        self.assertIs(bt.select_stop_pl, trading_math.select_stop_pl)
+        with open(os.path.join(ROOT, "backtest.py"), encoding="utf-8") as fh:
+            self.assertNotIn("def select_stop_pl", fh.read())
+
+
 class TestHeartbeat(unittest.TestCase):
     """The bot must prove PROGRESS, not mere existence."""
 
