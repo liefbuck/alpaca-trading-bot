@@ -736,6 +736,74 @@ class TestBacktestHarness(unittest.TestCase):
             self.assertNotIn("def select_stop_pl", fh.read())
 
 
+class TestEntryBacktestFairness(unittest.TestCase):
+    """The screener-vs-random test is only decisive if the arms are fair.
+
+    Its whole value is that ONLY the symbol differs between arms; any asymmetry
+    (a free fill for random, a peek at the future, a single lucky draw) turns a
+    decisive answer into a confident wrong one.
+    """
+
+    def setUp(self):
+        with open(os.path.join(ROOT, "entry_backtest.py"), encoding="utf-8") as fh:
+            self.src = fh.read()
+
+    def test_reuses_the_validated_exit_engine(self):
+        # A private copy of the exit rules could drift from the bot AND from
+        # backtest.py's calibration, grading a bracket nobody runs.
+        import entry_backtest as eb
+        self.assertIs(eb.bt.simulate, __import__("backtest").simulate)
+        self.assertNotIn("def simulate(", self.src)
+
+    def test_both_arms_are_simulated_the_same_way(self):
+        # Comparing a simulated random arm to the screener's REALISED fills would
+        # hand random a free fill and bias the test against the screener.
+        import entry_backtest as eb
+        self.assertIn("def simulate_entry", self.src)
+        # Exactly one entry path, used by both arms.
+        self.assertEqual(self.src.count("def simulate_entry"), 1)
+        self.assertGreaterEqual(self.src.count("simulate_entry("), 3)  # screener + random + spy
+
+    def test_price_at_never_peeks_backwards_in_time(self):
+        import entry_backtest as eb
+        t0 = ET.localize(dt.datetime.combine(dt.date(2026, 6, 15), dt.time(9, 40)))
+        bars = [(t0 + dt.timedelta(minutes=i), 100.0 + i, 0, 0, 0) for i in range(5)]
+        want = t0 + dt.timedelta(minutes=2)
+        px, ts = eb.price_at(bars, want)
+        self.assertGreaterEqual(ts, want)      # never an earlier (unknowable) bar
+        self.assertEqual(px, 102.0)            # the bar's OPEN, not a later print
+
+    def test_price_at_returns_none_past_the_end(self):
+        import entry_backtest as eb
+        t0 = ET.localize(dt.datetime.combine(dt.date(2026, 6, 15), dt.time(9, 40)))
+        bars = [(t0, 100.0, 0, 0, 0)]
+        px, ts = eb.price_at(bars, t0 + dt.timedelta(hours=2))
+        self.assertIsNone(px)
+
+    def test_eligibility_is_computed_strictly_before_the_day(self):
+        # The liquidity filter must not see the future. shift(1) is the mechanism:
+        # every row then carries only the previous completed bar's values, so a
+        # row dated `day` cannot know anything about `day`.
+        self.assertIn("close.shift(1)", self.src)
+        self.assertIn("adv20.shift(1)", self.src)
+
+    def test_random_arm_uses_many_draws_not_one(self):
+        # One random portfolio is a single sample from a wide distribution and
+        # proves nothing either way; the answer must be a percentile.
+        import entry_backtest as eb
+        self.assertGreaterEqual(eb.N_DRAWS, 100)
+        self.assertIn("percentile", self.src)
+
+    def test_random_pool_uses_the_bots_own_liquidity_gate(self):
+        # Random must draw from the same pool the screener draws from.
+        self.assertIn("MIN_SHARE_PRICE", self.src)
+        self.assertIn("MIN_AVG_DOLLAR_VOL", self.src)
+
+    def test_both_arms_size_to_the_same_notional(self):
+        self.assertIn("POSITION_NOTIONAL", self.src)
+        self.assertNotIn("random.uniform", self.src)
+
+
 class TestHeartbeat(unittest.TestCase):
     """The bot must prove PROGRESS, not mere existence."""
 
