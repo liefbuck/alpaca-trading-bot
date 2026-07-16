@@ -333,6 +333,6 @@
     "best_trade": 10.03,
     "worst_trade": -28.6,
     "result": "LOSS",
-    "final": false
+    "final": true
   }
 ]
