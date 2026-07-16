@@ -735,15 +735,46 @@ def check_pnl():
         persist_halted(True)
 
 
-def load_performance() -> list:
+def load_performance() -> tuple:
+    """Returns (history, ok).
+
+    ok=False means the file EXISTS but could not be parsed. That is NOT the same
+    as "no history yet", and conflating the two is destructive: the caller would
+    treat a transient read failure as an empty log and overwrite months of real
+    data with a single row. A missing file returns ([], True) — legitimately empty.
+    """
     if not os.path.exists(PERF_FILE):
-        return []
+        return [], True
     try:
         with open(PERF_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception as e:
-        log.warning(f"performance_log.json unreadable ({e}) — starting fresh history.")
-        return []
+        log.error(f"performance_log.json UNREADABLE ({e}) — refusing to treat it as empty.")
+        return [], False
+    if not isinstance(data, list) or any("date" not in h for h in data):
+        log.error("performance_log.json has an unexpected shape — refusing to treat it as empty.")
+        return [], False
+    return data, True
+
+
+def quarantine_performance() -> bool:
+    """Move an unreadable performance log aside so a rebuild can proceed.
+
+    Called ONLY from startup backfill, never mid-session: the corrupt file is
+    preserved (never deleted) for forensics, and backfill immediately rebuilds
+    the history from broker truth, which is authoritative anyway.
+    """
+    if not os.path.exists(PERF_FILE):
+        return False
+    dest = f"{PERF_FILE}.corrupt_{datetime.now(ET).strftime('%Y%m%d_%H%M%S')}"
+    try:
+        os.replace(PERF_FILE, dest)
+        log.error(f"Quarantined unreadable performance log to {os.path.basename(dest)} — "
+                  "rebuilding from broker truth.")
+        return True
+    except Exception as e:
+        log.error(f"Could not quarantine the performance log ({e}) — leaving it untouched.")
+        return False
 
 
 def build_perf_entry(date: str, daily_pnl: float, trades: list, final: bool) -> dict:
@@ -760,10 +791,21 @@ def build_perf_entry(date: str, daily_pnl: float, trades: list, final: bool) -> 
 
 
 def upsert_performance(entries: list):
-    """Merge rows into performance_log.json by date, newest write wins."""
+    """Merge rows into performance_log.json by date, newest write wins.
+
+    REFUSES to write when the existing file is present but unreadable. Skipping
+    one 60s snapshot costs nothing; overwriting turns a possibly-recoverable file
+    into permanent data loss. Startup's quarantine_performance() is the only path
+    allowed to move a bad file aside, and it rebuilds from broker truth after.
+    """
     if not entries:
         return
-    history = load_performance()
+    history, ok = load_performance()
+    if not ok:
+        log.error("Skipping performance write — the existing log is unreadable and "
+                  "overwriting it would destroy the history. It will be quarantined "
+                  "and rebuilt from broker truth at the next startup.")
+        return
     dates = {e["date"] for e in entries}
     history = [h for h in history if h["date"] not in dates]
     history.extend(entries)
@@ -835,7 +877,13 @@ def backfill_performance_history():
     Only touches PAST days that are missing or still provisional — a settled row,
     and today's live row, are never rewritten.
     """
-    history = load_performance()
+    history, ok = load_performance()
+    if not ok:
+        # Unreadable: preserve it, then rebuild everything the broker still knows
+        # about. Doing this at startup only means a mid-session blip can never
+        # trigger it.
+        quarantine_performance()
+        history = []
     settled = {h["date"] for h in history if h.get("final", True)}
     today = str(datetime.now(ET).date())
 

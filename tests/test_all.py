@@ -880,6 +880,21 @@ class TestWatchdogWedgeDetection(unittest.TestCase):
         # machine-wide lock instead, not by narrowing this.
         self.assertIn('$_.CommandLine -like "*$scriptName*"', self.wd)
 
+    def test_stall_limit_outlasts_a_full_entry_cycle(self):
+        # open_positions runs INSIDE schedule.run_pending(), and beat() only fires
+        # after run_pending returns -- so the heartbeat legitimately goes stale for
+        # the whole scan + fill budget (~4min scan + 300s budget today). The entry
+        # window normally covers this, but the startup catchup can fire an entry at
+        # 10:29 that outruns the window's 10:35 end, and then only this margin
+        # stops the watchdog killing a perfectly healthy bot mid-entry.
+        import re
+        budget = float(re.search(r'ENTRY_BUDGET_S\s*=\s*([\d.]+)', self.bot).group(1))
+        scan_allowance = 300.0     # observed ~230s for the ~1500-ticker scan
+        limit = int(self._ps_var("stallLimitSec"))
+        self.assertGreater(limit, budget + scan_allowance,
+                           "stallLimitSec must outlast a full scan+entry cycle or the "
+                           "watchdog will kill the bot while it is legitimately buying")
+
     def test_watchdog_reads_the_same_heartbeat_file_the_bot_writes(self):
         import bot
         self.assertIn(os.path.basename(bot.HEARTBEAT_FILE), self.wd)
@@ -1063,6 +1078,106 @@ class TestPerformanceDurability(unittest.TestCase):
             with open(perf) as f:
                 hist = json.load(f)
             self.assertTrue(hist[0]["final"])
+
+
+class TestPerformanceLogIsNeverDestroyed(unittest.TestCase):
+    """An unreadable log must NEVER be overwritten.
+
+    load_performance used to return [] for BOTH "no file yet" and "file is
+    corrupt", so one bad read made upsert write a single row over the whole
+    history. Harmless-ish at 1 write/day; catastrophic once check_pnl started
+    snapshotting every 60s.
+    """
+    CORRUPT = "{ this is not valid json"
+
+    def _seed(self, d, rows=6):
+        perf = os.path.join(d, "perf.json")
+        hist = [{"date": f"2026-06-{i:02d}", "daily_pnl": -1.0 * i, "trades": 1,
+                 "wins": 0, "losses": 1, "win_rate": 0.0, "best_trade": 0.0,
+                 "worst_trade": -1.0, "result": "LOSS", "final": True}
+                for i in range(1, rows + 1)]
+        with open(perf, "w") as fh:
+            json.dump(hist, fh)
+        return perf, hist
+
+    def test_corrupt_file_is_not_overwritten(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf, _ = self._seed(d)
+            with open(perf, "w") as fh:
+                fh.write(self.CORRUPT)
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "STATE_FILE", os.path.join(d, "s.json")), \
+                 mock.patch.object(bot, "_last_perf_snapshot", 0.0):
+                bot.save_state({"trades_today": []})
+                bot.snapshot_performance(-158.36)
+            with open(perf) as fh:
+                self.assertEqual(fh.read(), self.CORRUPT)   # byte-for-byte untouched
+
+    def test_eod_write_also_refuses_over_a_corrupt_file(self):
+        # The settled 15:45 write must be just as careful as the snapshot.
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf = os.path.join(d, "perf.json")
+            with open(perf, "w") as fh:
+                fh.write(self.CORRUPT)
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "STATE_FILE", os.path.join(d, "s.json")), \
+                 mock.patch.object(bot, "get_daily_pnl", return_value=1.0):
+                bot.save_state({"trades_today": []})
+                bot.log_daily_performance()
+            with open(perf) as fh:
+                self.assertEqual(fh.read(), self.CORRUPT)
+
+    def test_missing_file_is_legitimately_empty_and_still_writes(self):
+        # "No file yet" must NOT be conflated with "corrupt" in the other
+        # direction either — a first run has to be able to create the log.
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf = os.path.join(d, "perf.json")
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "STATE_FILE", os.path.join(d, "s.json")), \
+                 mock.patch.object(bot, "_last_perf_snapshot", 0.0):
+                bot.save_state({"trades_today": []})
+                bot.snapshot_performance(-5.0)
+            with open(perf) as fh:
+                self.assertEqual(len(json.load(fh)), 1)
+
+    def test_healthy_file_still_merges_normally(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf, hist = self._seed(d)
+            with mock.patch.object(bot, "PERF_FILE", perf), \
+                 mock.patch.object(bot, "STATE_FILE", os.path.join(d, "s.json")), \
+                 mock.patch.object(bot, "_last_perf_snapshot", 0.0):
+                bot.save_state({"trades_today": []})
+                bot.snapshot_performance(-158.36)
+            with open(perf) as fh:
+                self.assertEqual(len(json.load(fh)), len(hist) + 1)
+
+    def test_a_non_list_payload_is_treated_as_corrupt(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf = os.path.join(d, "perf.json")
+            with open(perf, "w") as fh:
+                json.dump({"date": "2026-06-01"}, fh)     # dict, not a list
+            with mock.patch.object(bot, "PERF_FILE", perf):
+                hist, ok = bot.load_performance()
+            self.assertFalse(ok)
+
+    def test_quarantine_preserves_the_bad_file_and_clears_the_path(self):
+        import bot
+        with tempfile.TemporaryDirectory() as d:
+            perf = os.path.join(d, "perf.json")
+            with open(perf, "w") as fh:
+                fh.write(self.CORRUPT)
+            with mock.patch.object(bot, "PERF_FILE", perf):
+                self.assertTrue(bot.quarantine_performance())
+            kept = [f for f in os.listdir(d) if ".corrupt_" in f]
+            self.assertEqual(len(kept), 1)               # preserved, never deleted
+            with open(os.path.join(d, kept[0])) as fh:
+                self.assertEqual(fh.read(), self.CORRUPT)
+            self.assertFalse(os.path.exists(perf))       # rebuild can proceed
 
 
 class TestPerformanceBackfill(unittest.TestCase):
